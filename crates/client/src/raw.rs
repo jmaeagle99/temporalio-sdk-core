@@ -10,16 +10,13 @@ use crate::{
 };
 use dyn_clone::DynClone;
 use futures_util::{FutureExt, TryFutureExt, future::BoxFuture};
-use std::{any::Any, marker::PhantomData, sync::Arc};
+use prost::Message;
+use std::{any::Any, collections::HashMap, marker::PhantomData, sync::Arc};
 use temporalio_common::{
     protos::{
         grpc::health::v1::{health_client::HealthClient, *},
         temporal::api::{
-            cloud::cloudservice::{v1 as cloudreq, v1::cloud_service_client::CloudServiceClient},
-            operatorservice::v1::{operator_service_client::OperatorServiceClient, *},
-            taskqueue::v1::TaskQueue,
-            testservice::v1::{test_service_client::TestServiceClient, *},
-            workflowservice::v1::{workflow_service_client::WorkflowServiceClient, *},
+            cloud::cloudservice::v1::{self as cloudreq, cloud_service_client::CloudServiceClient}, common::v1::{Payload, Payloads}, operatorservice::v1::{operator_service_client::OperatorServiceClient, *}, taskqueue::v1::TaskQueue, testservice::v1::{test_service_client::TestServiceClient, *}, workflowservice::v1::{workflow_service_client::WorkflowServiceClient, *}
         },
     },
     telemetry::metrics::MetricKeyValue,
@@ -587,6 +584,37 @@ fn type_closure_two_arg<T, R, S>(arg1: R, arg2: T, f: impl FnOnce(R, T) -> S) ->
     f(arg1, arg2)
 }
 
+fn log_blob_size_exceeded_limits(actual_size: usize, namespace: &str, workflow_id: &str, run_id: &str) {
+    let limit_size = 0;
+    if actual_size > limit_size {
+        warn!(
+            "wf-namespace" = namespace,
+            "wf-id" = workflow_id,
+            "wf-run-id" = run_id,
+            "wf-size" = actual_size,
+            "Blob data size exceeds the warning limit."
+        );
+    }
+}
+
+fn payload_hashmap_size(map: &HashMap<::prost::alloc::string::String, Payload>) -> usize {
+    let mut size = 0;
+    for (key, payload) in map {
+        size += key.len();
+        size += payload.encoded_len();
+    }
+    size
+}
+
+fn payloads_hashmap_size(map: &HashMap<::prost::alloc::string::String, Payloads>) -> usize {
+    let mut size = 0;
+    for (key, payloads) in map {
+        size += key.len();
+        size += payloads.encoded_len();
+    }
+    size
+}
+
 proxier! {
     WorkflowService; ALL_IMPLEMENTED_WORKFLOW_SERVICE_RPCS; WorkflowServiceClient; workflow_client; defaults;
     (
@@ -720,6 +748,115 @@ proxier! {
         |r| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
+
+            for (_, query_result) in &r.get_ref().query_results {
+                if let Some(answer) = &query_result.answer {
+                    log_blob_size_exceeded_limits(
+                        answer.encoded_len(),
+                        &r.get_ref().namespace,
+                        "",
+                        "");
+                }
+            }
+
+            for command in &r.get_ref().commands {
+                if let Some(attributes) = &command.attributes {
+                    use temporalio_common::protos::temporal::api::command::v1::command::Attributes;
+                    match attributes {
+                        Attributes::ScheduleActivityTaskCommandAttributes(attrs) => {
+                            if let Some(input) = &attrs.input {
+                                log_blob_size_exceeded_limits(
+                                    input.encoded_len(),
+                                    &r.get_ref().namespace,
+                                    "",
+                                    "");
+                            }
+                        }
+                        Attributes::CompleteWorkflowExecutionCommandAttributes(attrs) => {
+                            if let Some(result) = &attrs.result {
+                                log_blob_size_exceeded_limits(
+                                    result.encoded_len(),
+                                    &r.get_ref().namespace,
+                                    "",
+                                    "");
+                            }
+                        }
+                        Attributes::FailWorkflowExecutionCommandAttributes(attrs) => {
+                            if let Some(failure) = &attrs.failure {
+                                log_blob_size_exceeded_limits(
+                                    failure.encoded_len(),
+                                    &r.get_ref().namespace,
+                                    "",
+                                    "");
+                            }
+                        }
+                        Attributes::RecordMarkerCommandAttributes(attrs) => {
+                            log_blob_size_exceeded_limits(
+                                payloads_hashmap_size(&attrs.details),
+                                &r.get_ref().namespace,
+                                "",
+                                "");
+                        }
+                        Attributes::ContinueAsNewWorkflowExecutionCommandAttributes(attrs) => {
+                            if let Some(input) = &attrs.input {
+                                log_blob_size_exceeded_limits(
+                                    input.encoded_len(),
+                                    &r.get_ref().namespace,
+                                    "",
+                                    "");
+                            }
+                        }
+                        Attributes::StartChildWorkflowExecutionCommandAttributes(attrs) => {
+                            if let Some(input) = &attrs.input {
+                                log_blob_size_exceeded_limits(
+                                    input.encoded_len(),
+                                    &r.get_ref().namespace,
+                                    "",
+                                    "");
+                            }
+                        }
+                        Attributes::SignalExternalWorkflowExecutionCommandAttributes(attrs) => {
+                            if let Some(input) = &attrs.input {
+                                log_blob_size_exceeded_limits(
+                                    input.encoded_len(),
+                                    &r.get_ref().namespace,
+                                    "",
+                                    "");
+                            }
+                        }
+                        Attributes::UpsertWorkflowSearchAttributesCommandAttributes(attrs) => {
+                            if let Some(search_attrs) = &attrs.search_attributes {
+                                log_blob_size_exceeded_limits(
+                                    payload_hashmap_size(&search_attrs.indexed_fields),
+                                    &r.get_ref().namespace,
+                                    "",
+                                    "");
+                            }
+                        }
+                        Attributes::ModifyWorkflowPropertiesCommandAttributes(attrs) => {
+                            if let Some(upserted_memo) = &attrs.upserted_memo {
+                                log_blob_size_exceeded_limits(
+                                    payload_hashmap_size(&upserted_memo.fields),
+                                    &r.get_ref().namespace,
+                                    "",
+                                    "");
+                            }
+                        }
+                        Attributes::ScheduleNexusOperationCommandAttributes(attrs) => {
+                            if let Some(input) = &attrs.input {
+                                log_blob_size_exceeded_limits(
+                                    input.encoded_len(),
+                                    &r.get_ref().namespace,
+                                    "",
+                                    "");
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+
         }
     );
     (
@@ -729,6 +866,14 @@ proxier! {
         |r| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
+
+            if let Some(failure) = &r.get_ref().failure {
+                log_blob_size_exceeded_limits(
+                    failure.encoded_len(),
+                    &r.get_ref().namespace,
+                    "",
+                    "");
+            }
         }
     );
     (
@@ -748,6 +893,14 @@ proxier! {
         |r| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
+
+            if let Some(details) = &r.get_ref().details {
+                log_blob_size_exceeded_limits(
+                    details.encoded_len(),
+                    &r.get_ref().namespace,
+                    "",
+                    "");
+            }
         }
     );
     (
@@ -757,6 +910,14 @@ proxier! {
         |r| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
+
+            if let Some(details) = &r.get_ref().details {
+                log_blob_size_exceeded_limits(
+                    details.encoded_len(),
+                    &r.get_ref().namespace,
+                    "",
+                    "");
+            }
         }
     );
     (
@@ -766,6 +927,14 @@ proxier! {
         |r| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
+
+            if let Some(result) = &r.get_ref().result {
+                log_blob_size_exceeded_limits(
+                    result.encoded_len(),
+                    &r.get_ref().namespace,
+                    "",
+                    "");
+            }
         }
     );
     (
@@ -775,6 +944,14 @@ proxier! {
         |r| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
+
+            if let Some(result) = &r.get_ref().result {
+                log_blob_size_exceeded_limits(
+                    result.encoded_len(),
+                    &r.get_ref().namespace,
+                    "",
+                    &r.get_ref().run_id);
+            }
         }
     );
 
@@ -785,6 +962,21 @@ proxier! {
         |r| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
+
+            if let Some(last_heartbeat_details) = &r.get_ref().last_heartbeat_details {
+                log_blob_size_exceeded_limits(
+                    last_heartbeat_details.encoded_len(),
+                    &r.get_ref().namespace,
+                    "",
+                    "");
+            }
+            if let Some(failure) = &r.get_ref().failure {
+                log_blob_size_exceeded_limits(
+                    failure.encoded_len(),
+                    &r.get_ref().namespace,
+                    "",
+                    "");
+            }
         }
     );
     (
@@ -794,6 +986,21 @@ proxier! {
         |r| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
+
+            if let Some(last_heartbeat_details) = &r.get_ref().last_heartbeat_details {
+                log_blob_size_exceeded_limits(
+                    last_heartbeat_details.encoded_len(),
+                    &r.get_ref().namespace,
+                    "",
+                    &r.get_ref().run_id);
+            }
+            if let Some(failure) = &r.get_ref().failure {
+                log_blob_size_exceeded_limits(
+                    failure.encoded_len(),
+                    &r.get_ref().namespace,
+                    "",
+                    &r.get_ref().run_id);
+            }
         }
     );
     (
@@ -803,6 +1010,14 @@ proxier! {
         |r| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
+
+            if let Some(details) = &r.get_ref().details {
+                log_blob_size_exceeded_limits(
+                    details.encoded_len(),
+                    &r.get_ref().namespace,
+                    "",
+                    "");
+            }
         }
     );
     (
@@ -812,6 +1027,14 @@ proxier! {
         |r| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
+
+            if let Some(details) = &r.get_ref().details {
+                log_blob_size_exceeded_limits(
+                    details.encoded_len(),
+                    &r.get_ref().namespace,
+                    "",
+                    &r.get_ref().run_id);
+            }
         }
     );
     (
@@ -830,6 +1053,20 @@ proxier! {
         |r| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
+
+            if let Some(input) = &r.get_ref().input {
+                let mut workflow_id = "";
+                let mut run_id = "";
+                if let Some(workflow_execution) = &r.get_ref().workflow_execution {
+                    workflow_id = &workflow_execution.workflow_id;
+                    run_id = &workflow_execution.run_id;
+                }
+                log_blob_size_exceeded_limits(
+                    input.encoded_len(),
+                    &r.get_ref().namespace,
+                    workflow_id,
+                    run_id);
+            }
         }
     );
     (
@@ -980,6 +1217,14 @@ proxier! {
         |r| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
+
+            if let Some(query_result) = &r.get_ref().query_result {
+                log_blob_size_exceeded_limits(
+                    query_result.encoded_len(),
+                    &r.get_ref().namespace,
+                    "",
+                    "");
+            }
         }
     );
     (
@@ -998,6 +1243,22 @@ proxier! {
         |r| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
+
+            if let Some(query) = &r.get_ref().query {
+                if let Some(query_args) = &query.query_args {
+                    let mut workflow_id = "";
+                    let mut run_id = "";
+                    if let Some(execution) = &r.get_ref().execution {
+                        workflow_id = &execution.workflow_id;
+                        run_id = &execution.run_id
+                    }
+                    log_blob_size_exceeded_limits(
+                        query_args.encoded_len(),
+                        &r.get_ref().namespace,
+                        workflow_id,
+                        run_id);
+                }
+            }
         }
     );
     (
@@ -1046,6 +1307,15 @@ proxier! {
         |r| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
+
+            // TODO: Need more sizing from schedule.action.action.startworkflow.input
+            if let Some(memo) = &r.get_ref().memo {
+                log_blob_size_exceeded_limits(
+                    memo.encoded_len(),
+                    &r.get_ref().namespace,
+                    &r.get_ref().schedule_id,
+                    "");
+            }
         }
     );
     (
@@ -1064,6 +1334,8 @@ proxier! {
         |r| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
+
+            // TODO: Do same calculation as server
         }
     );
     (
@@ -1073,6 +1345,8 @@ proxier! {
         |r| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
+
+            // TODO: Do same calculation as server
         }
     );
     (
@@ -1082,6 +1356,8 @@ proxier! {
         |r| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
+
+            // TODO: Do same calculation as server
         }
     );
     (

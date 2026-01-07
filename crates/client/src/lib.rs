@@ -176,6 +176,9 @@ pub struct ClientOptions {
     /// If set true, get_system_info will not be called upon connection
     #[builder(default)]
     pub skip_get_system_info: bool,
+
+    /// If set, use the payloads options as specified by the [PayloadsOptions] struct.
+    pub payloads_options: Option<PayloadsOptions>
 }
 
 /// Configuration options for TLS
@@ -310,6 +313,26 @@ impl Debug for ClientTlsOptions {
     // Intentionally omit details here since they could leak a key if ever printed
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "ClientTlsOptions(..)")
+    }
+}
+
+
+/// Configuration options for payloads
+#[derive(Clone, Debug)]
+pub struct PayloadsOptions {
+    /// The threshold at which a warning is made for each Payloads collection that has
+    /// a size in bytes that is greater than this value.
+    pub upload_size_warn_limit: usize,
+    /// Bool indicating whether upload size warning should be disabled.
+    pub upload_size_warn_disabled: bool,
+}
+
+impl Default for PayloadsOptions {
+    fn default() -> Self {
+        Self {
+            upload_size_warn_disabled: false,
+            upload_size_warn_limit: 512 * 1024 // 512 KiB
+        }
     }
 }
 
