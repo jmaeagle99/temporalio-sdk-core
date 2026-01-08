@@ -34,6 +34,10 @@ trait RawClientProducer {
     /// core can safely return `None`.
     fn get_workers_info(&self) -> Option<Arc<ClientWorkerSet>>;
 
+    /// Returns the payloads options associated with this client. Implementers outside of
+    /// core can safely return `None`.
+    fn get_payloads_options(&self) -> Option<Arc<crate::PayloadsOptions>>;
+
     /// Return a workflow service client instance
     fn workflow_client(&mut self) -> Box<dyn WorkflowService>;
 
@@ -178,6 +182,10 @@ where
         self.get_client().get_workers_info()
     }
 
+    fn get_payloads_options(&self) -> Option<Arc<crate::PayloadsOptions>> {
+        self.get_client().get_payloads_options()
+    }
+
     fn workflow_client(&mut self) -> Box<dyn WorkflowService> {
         self.get_client_mut().workflow_client()
     }
@@ -255,6 +263,11 @@ where
     fn get_workers_info(&self) -> Option<Arc<ClientWorkerSet>> {
         self.inner_cow().get_workers_info()
     }
+
+    fn get_payloads_options(&self) -> Option<Arc<crate::PayloadsOptions>> {
+        self.inner_cow().get_payloads_options()
+    }
+
     fn workflow_client(&mut self) -> Box<dyn WorkflowService> {
         self.inner_mut_refreshed().workflow_client()
     }
@@ -287,6 +300,10 @@ impl RawClientProducer for TemporalServiceClient {
         None
     }
 
+    fn get_payloads_options(&self) -> Option<Arc<crate::PayloadsOptions>> {
+        None
+    }
+
     fn workflow_client(&mut self) -> Box<dyn WorkflowService> {
         self.workflow_svc()
     }
@@ -315,6 +332,10 @@ impl RawClientProducer for ConfiguredClient<TemporalServiceClient> {
         Some(self.workers())
     }
 
+    fn get_payloads_options(&self) -> Option<Arc<crate::PayloadsOptions>> {
+        self.options.payloads_options.as_ref().map(|opts| Arc::new(opts.clone()))
+    }
+
     fn workflow_client(&mut self) -> Box<dyn WorkflowService> {
         self.client.workflow_client()
     }
@@ -341,6 +362,10 @@ impl RawGrpcCaller for ConfiguredClient<TemporalServiceClient> {}
 impl RawClientProducer for Client {
     fn get_workers_info(&self) -> Option<Arc<ClientWorkerSet>> {
         self.inner.get_workers_info()
+    }
+
+    fn get_payloads_options(&self) -> Option<Arc<crate::PayloadsOptions>> {
+        self.inner.get_payloads_options()
     }
 
     fn workflow_client(&mut self) -> Box<dyn WorkflowService> {
@@ -443,7 +468,7 @@ macro_rules! proxy_impl {
             #[allow(unused_mut)]
             mut request: tonic::Request<$req>,
         ) -> BoxFuture<'_, Result<tonic::Response<$resp>, tonic::Status>> {
-            $( type_closure_arg(&mut request, $closure); )*
+            $( type_closure_two_arg(&mut request, self.get_payloads_options(), $closure); )*
             #[allow(unused_mut)]
             let fact = |c: &mut Self, mut req: tonic::Request<$req>| {
                 let mut c = c.$client_meth();
@@ -459,7 +484,7 @@ macro_rules! proxy_impl {
             &mut self,
             mut request: tonic::Request<$req>,
         ) -> BoxFuture<'_, Result<tonic::Response<$resp>, tonic::Status>> {
-            type_closure_arg(&mut request, $closure_request);
+            type_closure_two_arg(&mut request, self.get_payloads_options(), $closure_request);
             #[allow(unused_mut)]
             let fact = |c: &mut Self, mut req: tonic::Request<$req>| {
                 let data = type_closure_two_arg(&mut req, c.get_workers_info(), $closure_before);
@@ -478,7 +503,7 @@ macro_rules! proxy_impl {
             #[allow(unused_mut)]
             mut request: tonic::Request<$req>,
         ) -> BoxFuture<'_, Result<tonic::Response<$resp>, tonic::Status>> {
-            $( type_closure_arg(&mut request, $closure); )*
+            $( type_closure_two_arg(&mut request, Option::<Arc<crate::PayloadsOptions>>::None, $closure); )*
             async move { <$client_type<_>>::$method(self, request).await }.boxed()
         }
     };
@@ -489,7 +514,7 @@ macro_rules! proxy_impl {
             &mut self,
             mut request: tonic::Request<$req>,
         ) -> BoxFuture<'_, Result<tonic::Response<$resp>, tonic::Status>> {
-            type_closure_arg(&mut request, $closure_request);
+            type_closure_two_arg(&mut request, Option::<Arc<crate::PayloadsOptions>>::None, $closure_request);
             let data = type_closure_two_arg(&mut request, Option::<Arc<ClientWorkerSet>>::None,
                                             $closure_before);
             async move {
@@ -576,24 +601,28 @@ macro_rules! namespaced_request {
 }
 
 // Nice little trick to avoid the callsite asking to type the closure parameter
-fn type_closure_arg<T, R>(arg: T, f: impl FnOnce(T) -> R) -> R {
-    f(arg)
-}
-
 fn type_closure_two_arg<T, R, S>(arg1: R, arg2: T, f: impl FnOnce(R, T) -> S) -> S {
     f(arg1, arg2)
 }
 
-fn log_blob_size_exceeded_limits(actual_size: usize, namespace: &str, workflow_id: &str, run_id: &str) {
-    let limit_size = 0;
-    if actual_size > limit_size {
-        warn!(
-            "wf-namespace" = namespace,
-            "wf-id" = workflow_id,
-            "wf-run-id" = run_id,
-            "wf-size" = actual_size,
-            "Blob data size exceeds the warning limit."
-        );
+fn log_blob_size_exceeded_limits(
+    actual_size: usize,
+    namespace: &str,
+    workflow_id: &str,
+    run_id: &str,
+    payloads_options: Option<&Arc<crate::PayloadsOptions>>
+) {
+    if let Some(opts) = payloads_options {
+        if !opts.upload_size_warn_disabled && actual_size > opts.upload_size_warn_limit {
+            warn!(
+                "wf-namespace" = namespace,
+                "wf-id" = workflow_id,
+                "wf-run-id" = run_id,
+                "wf-size" = actual_size,
+                "wf-limit" = opts.upload_size_warn_limit,
+                "Blob data size exceeds the warning limit."
+            );
+        }
     }
 }
 
@@ -621,7 +650,7 @@ proxier! {
         register_namespace,
         RegisterNamespaceRequest,
         RegisterNamespaceResponse,
-        |r| {
+        |r, _opts| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
         }
@@ -630,7 +659,7 @@ proxier! {
         describe_namespace,
         DescribeNamespaceRequest,
         DescribeNamespaceResponse,
-        |r| {
+        |r, _opts| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
         }
@@ -644,7 +673,7 @@ proxier! {
         update_namespace,
         UpdateNamespaceRequest,
         UpdateNamespaceResponse,
-        |r| {
+        |r, _opts| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
         }
@@ -653,7 +682,7 @@ proxier! {
         deprecate_namespace,
         DeprecateNamespaceRequest,
         DeprecateNamespaceResponse,
-        |r| {
+        |r, _opts| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
         }
@@ -662,7 +691,7 @@ proxier! {
         start_workflow_execution,
         StartWorkflowExecutionRequest,
         StartWorkflowExecutionResponse,
-        |r| {
+        |r, _opts| {
             let mut labels = namespaced_request!(r);
             labels.task_q(r.get_ref().task_queue.clone());
             r.extensions_mut().insert(labels);
@@ -714,7 +743,7 @@ proxier! {
         get_workflow_execution_history,
         GetWorkflowExecutionHistoryRequest,
         GetWorkflowExecutionHistoryResponse,
-        |r| {
+        |r, _opts| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
             if r.get_ref().wait_new_event {
@@ -726,7 +755,7 @@ proxier! {
         get_workflow_execution_history_reverse,
         GetWorkflowExecutionHistoryReverseRequest,
         GetWorkflowExecutionHistoryReverseResponse,
-        |r| {
+        |r, _opts| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
         }
@@ -735,7 +764,7 @@ proxier! {
         poll_workflow_task_queue,
         PollWorkflowTaskQueueRequest,
         PollWorkflowTaskQueueResponse,
-        |r| {
+        |r, _opts| {
             let mut labels = namespaced_request!(r);
             labels.task_q(r.get_ref().task_queue.clone());
             r.extensions_mut().insert(labels);
@@ -745,7 +774,7 @@ proxier! {
         respond_workflow_task_completed,
         RespondWorkflowTaskCompletedRequest,
         RespondWorkflowTaskCompletedResponse,
-        |r| {
+        |r, opts| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
 
@@ -753,9 +782,7 @@ proxier! {
                 if let Some(answer) = &query_result.answer {
                     log_blob_size_exceeded_limits(
                         answer.encoded_len(),
-                        &r.get_ref().namespace,
-                        "",
-                        "");
+                        &r.get_ref().namespace, "", "", opts.as_ref());
                 }
             }
 
@@ -767,88 +794,68 @@ proxier! {
                             if let Some(input) = &attrs.input {
                                 log_blob_size_exceeded_limits(
                                     input.encoded_len(),
-                                    &r.get_ref().namespace,
-                                    "",
-                                    "");
+                                    &r.get_ref().namespace, "", "", opts.as_ref());
                             }
                         }
                         Attributes::CompleteWorkflowExecutionCommandAttributes(attrs) => {
                             if let Some(result) = &attrs.result {
                                 log_blob_size_exceeded_limits(
                                     result.encoded_len(),
-                                    &r.get_ref().namespace,
-                                    "",
-                                    "");
+                                    &r.get_ref().namespace, "", "", opts.as_ref());
                             }
                         }
                         Attributes::FailWorkflowExecutionCommandAttributes(attrs) => {
                             if let Some(failure) = &attrs.failure {
                                 log_blob_size_exceeded_limits(
                                     failure.encoded_len(),
-                                    &r.get_ref().namespace,
-                                    "",
-                                    "");
+                                    &r.get_ref().namespace, "", "", opts.as_ref());
                             }
                         }
                         Attributes::RecordMarkerCommandAttributes(attrs) => {
                             log_blob_size_exceeded_limits(
                                 payloads_hashmap_size(&attrs.details),
-                                &r.get_ref().namespace,
-                                "",
-                                "");
+                                &r.get_ref().namespace, "", "", opts.as_ref());
                         }
                         Attributes::ContinueAsNewWorkflowExecutionCommandAttributes(attrs) => {
                             if let Some(input) = &attrs.input {
                                 log_blob_size_exceeded_limits(
                                     input.encoded_len(),
-                                    &r.get_ref().namespace,
-                                    "",
-                                    "");
+                                    &r.get_ref().namespace, "", "", opts.as_ref());
                             }
                         }
                         Attributes::StartChildWorkflowExecutionCommandAttributes(attrs) => {
                             if let Some(input) = &attrs.input {
                                 log_blob_size_exceeded_limits(
                                     input.encoded_len(),
-                                    &r.get_ref().namespace,
-                                    "",
-                                    "");
+                                    &r.get_ref().namespace, "", "", opts.as_ref());
                             }
                         }
                         Attributes::SignalExternalWorkflowExecutionCommandAttributes(attrs) => {
                             if let Some(input) = &attrs.input {
                                 log_blob_size_exceeded_limits(
                                     input.encoded_len(),
-                                    &r.get_ref().namespace,
-                                    "",
-                                    "");
+                                    &r.get_ref().namespace, "", "", opts.as_ref());
                             }
                         }
                         Attributes::UpsertWorkflowSearchAttributesCommandAttributes(attrs) => {
                             if let Some(search_attrs) = &attrs.search_attributes {
                                 log_blob_size_exceeded_limits(
                                     payload_hashmap_size(&search_attrs.indexed_fields),
-                                    &r.get_ref().namespace,
-                                    "",
-                                    "");
+                                    &r.get_ref().namespace, "", "", opts.as_ref());
                             }
                         }
                         Attributes::ModifyWorkflowPropertiesCommandAttributes(attrs) => {
                             if let Some(upserted_memo) = &attrs.upserted_memo {
                                 log_blob_size_exceeded_limits(
                                     payload_hashmap_size(&upserted_memo.fields),
-                                    &r.get_ref().namespace,
-                                    "",
-                                    "");
+                                    &r.get_ref().namespace, "", "", opts.as_ref());
                             }
                         }
                         Attributes::ScheduleNexusOperationCommandAttributes(attrs) => {
                             if let Some(input) = &attrs.input {
                                 log_blob_size_exceeded_limits(
                                     input.encoded_len(),
-                                    &r.get_ref().namespace,
-                                    "",
-                                    "");
+                                    &r.get_ref().namespace, "", "", opts.as_ref());
                             }
                         }
                         _ => {}
@@ -863,16 +870,14 @@ proxier! {
         respond_workflow_task_failed,
         RespondWorkflowTaskFailedRequest,
         RespondWorkflowTaskFailedResponse,
-        |r| {
+        |r, opts| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
 
             if let Some(failure) = &r.get_ref().failure {
                 log_blob_size_exceeded_limits(
                     failure.encoded_len(),
-                    &r.get_ref().namespace,
-                    "",
-                    "");
+                    &r.get_ref().namespace, "", "", opts.as_ref());
             }
         }
     );
@@ -880,7 +885,7 @@ proxier! {
         poll_activity_task_queue,
         PollActivityTaskQueueRequest,
         PollActivityTaskQueueResponse,
-        |r| {
+        |r, _opts| {
             let mut labels = namespaced_request!(r);
             labels.task_q(r.get_ref().task_queue.clone());
             r.extensions_mut().insert(labels);
@@ -890,7 +895,7 @@ proxier! {
         record_activity_task_heartbeat,
         RecordActivityTaskHeartbeatRequest,
         RecordActivityTaskHeartbeatResponse,
-        |r| {
+        |r, opts| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
 
@@ -899,7 +904,8 @@ proxier! {
                     details.encoded_len(),
                     &r.get_ref().namespace,
                     "",
-                    "");
+                    "",
+                    opts.as_ref());
             }
         }
     );
@@ -907,16 +913,14 @@ proxier! {
         record_activity_task_heartbeat_by_id,
         RecordActivityTaskHeartbeatByIdRequest,
         RecordActivityTaskHeartbeatByIdResponse,
-        |r| {
+        |r, opts| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
 
             if let Some(details) = &r.get_ref().details {
                 log_blob_size_exceeded_limits(
                     details.encoded_len(),
-                    &r.get_ref().namespace,
-                    "",
-                    "");
+                    &r.get_ref().namespace, "", "", opts.as_ref());
             }
         }
     );
@@ -924,16 +928,14 @@ proxier! {
         respond_activity_task_completed,
         RespondActivityTaskCompletedRequest,
         RespondActivityTaskCompletedResponse,
-        |r| {
+        |r, opts| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
 
             if let Some(result) = &r.get_ref().result {
                 log_blob_size_exceeded_limits(
                     result.encoded_len(),
-                    &r.get_ref().namespace,
-                    "",
-                    "");
+                    &r.get_ref().namespace, "", "", opts.as_ref());
             }
         }
     );
@@ -941,16 +943,12 @@ proxier! {
         respond_activity_task_completed_by_id,
         RespondActivityTaskCompletedByIdRequest,
         RespondActivityTaskCompletedByIdResponse,
-        |r| {
+        |r, opts| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
 
             if let Some(result) = &r.get_ref().result {
-                log_blob_size_exceeded_limits(
-                    result.encoded_len(),
-                    &r.get_ref().namespace,
-                    "",
-                    &r.get_ref().run_id);
+                log_blob_size_exceeded_limits(result.encoded_len(), &r.get_ref().namespace, "", &r.get_ref().run_id, opts.as_ref());
             }
         }
     );
@@ -959,23 +957,19 @@ proxier! {
         respond_activity_task_failed,
         RespondActivityTaskFailedRequest,
         RespondActivityTaskFailedResponse,
-        |r| {
+        |r, opts| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
 
             if let Some(last_heartbeat_details) = &r.get_ref().last_heartbeat_details {
                 log_blob_size_exceeded_limits(
                     last_heartbeat_details.encoded_len(),
-                    &r.get_ref().namespace,
-                    "",
-                    "");
+                    &r.get_ref().namespace, "", "", opts.as_ref());
             }
             if let Some(failure) = &r.get_ref().failure {
                 log_blob_size_exceeded_limits(
                     failure.encoded_len(),
-                    &r.get_ref().namespace,
-                    "",
-                    "");
+                    &r.get_ref().namespace, "", "", opts.as_ref());
             }
         }
     );
@@ -983,23 +977,15 @@ proxier! {
         respond_activity_task_failed_by_id,
         RespondActivityTaskFailedByIdRequest,
         RespondActivityTaskFailedByIdResponse,
-        |r| {
+        |r, opts| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
 
             if let Some(last_heartbeat_details) = &r.get_ref().last_heartbeat_details {
-                log_blob_size_exceeded_limits(
-                    last_heartbeat_details.encoded_len(),
-                    &r.get_ref().namespace,
-                    "",
-                    &r.get_ref().run_id);
+                log_blob_size_exceeded_limits(last_heartbeat_details.encoded_len(), &r.get_ref().namespace, "", &r.get_ref().run_id, opts.as_ref());
             }
             if let Some(failure) = &r.get_ref().failure {
-                log_blob_size_exceeded_limits(
-                    failure.encoded_len(),
-                    &r.get_ref().namespace,
-                    "",
-                    &r.get_ref().run_id);
+                log_blob_size_exceeded_limits(failure.encoded_len(), &r.get_ref().namespace, "", &r.get_ref().run_id, opts.as_ref());
             }
         }
     );
@@ -1007,16 +993,14 @@ proxier! {
         respond_activity_task_canceled,
         RespondActivityTaskCanceledRequest,
         RespondActivityTaskCanceledResponse,
-        |r| {
+        |r, opts| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
 
             if let Some(details) = &r.get_ref().details {
                 log_blob_size_exceeded_limits(
                     details.encoded_len(),
-                    &r.get_ref().namespace,
-                    "",
-                    "");
+                    &r.get_ref().namespace, "", "", opts.as_ref());
             }
         }
     );
@@ -1024,16 +1008,12 @@ proxier! {
         respond_activity_task_canceled_by_id,
         RespondActivityTaskCanceledByIdRequest,
         RespondActivityTaskCanceledByIdResponse,
-        |r| {
+        |r, opts| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
 
             if let Some(details) = &r.get_ref().details {
-                log_blob_size_exceeded_limits(
-                    details.encoded_len(),
-                    &r.get_ref().namespace,
-                    "",
-                    &r.get_ref().run_id);
+                log_blob_size_exceeded_limits(details.encoded_len(), &r.get_ref().namespace, "", &r.get_ref().run_id, opts.as_ref());
             }
         }
     );
@@ -1041,7 +1021,7 @@ proxier! {
         request_cancel_workflow_execution,
         RequestCancelWorkflowExecutionRequest,
         RequestCancelWorkflowExecutionResponse,
-        |r| {
+        |r, _opts| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
         }
@@ -1050,7 +1030,7 @@ proxier! {
         signal_workflow_execution,
         SignalWorkflowExecutionRequest,
         SignalWorkflowExecutionResponse,
-        |r| {
+        |r, opts| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
 
@@ -1064,8 +1044,7 @@ proxier! {
                 log_blob_size_exceeded_limits(
                     input.encoded_len(),
                     &r.get_ref().namespace,
-                    workflow_id,
-                    run_id);
+                    workflow_id, run_id, opts.as_ref());
             }
         }
     );
@@ -1073,7 +1052,7 @@ proxier! {
         signal_with_start_workflow_execution,
         SignalWithStartWorkflowExecutionRequest,
         SignalWithStartWorkflowExecutionResponse,
-        |r| {
+        |r, _opts| {
             let mut labels = namespaced_request!(r);
             labels.task_q(r.get_ref().task_queue.clone());
             r.extensions_mut().insert(labels);
@@ -1083,7 +1062,7 @@ proxier! {
         reset_workflow_execution,
         ResetWorkflowExecutionRequest,
         ResetWorkflowExecutionResponse,
-        |r| {
+        |r, _opts| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
         }
@@ -1092,7 +1071,7 @@ proxier! {
         terminate_workflow_execution,
         TerminateWorkflowExecutionRequest,
         TerminateWorkflowExecutionResponse,
-        |r| {
+        |r, _opts| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
         }
@@ -1101,7 +1080,7 @@ proxier! {
         delete_workflow_execution,
         DeleteWorkflowExecutionRequest,
         DeleteWorkflowExecutionResponse,
-        |r| {
+        |r, _opts| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
         }
@@ -1110,7 +1089,7 @@ proxier! {
         list_open_workflow_executions,
         ListOpenWorkflowExecutionsRequest,
         ListOpenWorkflowExecutionsResponse,
-        |r| {
+        |r, _opts| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
         }
@@ -1119,7 +1098,7 @@ proxier! {
         list_closed_workflow_executions,
         ListClosedWorkflowExecutionsRequest,
         ListClosedWorkflowExecutionsResponse,
-        |r| {
+        |r, _opts| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
         }
@@ -1128,7 +1107,7 @@ proxier! {
         list_workflow_executions,
         ListWorkflowExecutionsRequest,
         ListWorkflowExecutionsResponse,
-        |r| {
+        |r, _opts| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
         }
@@ -1137,7 +1116,7 @@ proxier! {
         list_archived_workflow_executions,
         ListArchivedWorkflowExecutionsRequest,
         ListArchivedWorkflowExecutionsResponse,
-        |r| {
+        |r, _opts| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
         }
@@ -1146,7 +1125,7 @@ proxier! {
         scan_workflow_executions,
         ScanWorkflowExecutionsRequest,
         ScanWorkflowExecutionsResponse,
-        |r| {
+        |r, _opts| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
         }
@@ -1155,7 +1134,7 @@ proxier! {
         count_workflow_executions,
         CountWorkflowExecutionsRequest,
         CountWorkflowExecutionsResponse,
-        |r| {
+        |r, _opts| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
         }
@@ -1164,7 +1143,7 @@ proxier! {
         create_workflow_rule,
         CreateWorkflowRuleRequest,
         CreateWorkflowRuleResponse,
-        |r| {
+        |r, _opts| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
         }
@@ -1173,7 +1152,7 @@ proxier! {
         describe_workflow_rule,
         DescribeWorkflowRuleRequest,
         DescribeWorkflowRuleResponse,
-        |r| {
+        |r, _opts| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
         }
@@ -1182,7 +1161,7 @@ proxier! {
         delete_workflow_rule,
         DeleteWorkflowRuleRequest,
         DeleteWorkflowRuleResponse,
-        |r| {
+        |r, _opts| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
         }
@@ -1191,7 +1170,7 @@ proxier! {
         list_workflow_rules,
         ListWorkflowRulesRequest,
         ListWorkflowRulesResponse,
-        |r| {
+        |r, _opts| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
         }
@@ -1200,7 +1179,7 @@ proxier! {
         trigger_workflow_rule,
         TriggerWorkflowRuleRequest,
         TriggerWorkflowRuleResponse,
-        |r| {
+        |r, _opts| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
         }
@@ -1214,16 +1193,14 @@ proxier! {
         respond_query_task_completed,
         RespondQueryTaskCompletedRequest,
         RespondQueryTaskCompletedResponse,
-        |r| {
+        |r, opts| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
 
             if let Some(query_result) = &r.get_ref().query_result {
                 log_blob_size_exceeded_limits(
                     query_result.encoded_len(),
-                    &r.get_ref().namespace,
-                    "",
-                    "");
+                    &r.get_ref().namespace, "", "", opts.as_ref());
             }
         }
     );
@@ -1231,7 +1208,7 @@ proxier! {
         reset_sticky_task_queue,
         ResetStickyTaskQueueRequest,
         ResetStickyTaskQueueResponse,
-        |r| {
+        |r, _opts| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
         }
@@ -1240,7 +1217,7 @@ proxier! {
         query_workflow,
         QueryWorkflowRequest,
         QueryWorkflowResponse,
-        |r| {
+        |r, opts| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
 
@@ -1255,8 +1232,7 @@ proxier! {
                     log_blob_size_exceeded_limits(
                         query_args.encoded_len(),
                         &r.get_ref().namespace,
-                        workflow_id,
-                        run_id);
+                        workflow_id, run_id, opts.as_ref());
                 }
             }
         }
@@ -1265,7 +1241,7 @@ proxier! {
         describe_workflow_execution,
         DescribeWorkflowExecutionRequest,
         DescribeWorkflowExecutionResponse,
-        |r| {
+        |r, _opts| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
         }
@@ -1274,7 +1250,7 @@ proxier! {
         describe_task_queue,
         DescribeTaskQueueRequest,
         DescribeTaskQueueResponse,
-        |r| {
+        |r, _opts| {
             let mut labels = namespaced_request!(r);
             labels.task_q(r.get_ref().task_queue.clone());
             r.extensions_mut().insert(labels);
@@ -1294,7 +1270,7 @@ proxier! {
         list_task_queue_partitions,
         ListTaskQueuePartitionsRequest,
         ListTaskQueuePartitionsResponse,
-        |r| {
+        |r, _opts| {
             let mut labels = namespaced_request!(r);
             labels.task_q(r.get_ref().task_queue.clone());
             r.extensions_mut().insert(labels);
@@ -1304,7 +1280,7 @@ proxier! {
         create_schedule,
         CreateScheduleRequest,
         CreateScheduleResponse,
-        |r| {
+        |r, opts| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
 
@@ -1314,7 +1290,8 @@ proxier! {
                     memo.encoded_len(),
                     &r.get_ref().namespace,
                     &r.get_ref().schedule_id,
-                    "");
+                    "",
+                    opts.as_ref());
             }
         }
     );
@@ -1322,7 +1299,7 @@ proxier! {
         describe_schedule,
         DescribeScheduleRequest,
         DescribeScheduleResponse,
-        |r| {
+        |r, _opts| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
         }
@@ -1331,7 +1308,7 @@ proxier! {
         update_schedule,
         UpdateScheduleRequest,
         UpdateScheduleResponse,
-        |r| {
+        |r, _opts| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
 
@@ -1342,7 +1319,7 @@ proxier! {
         patch_schedule,
         PatchScheduleRequest,
         PatchScheduleResponse,
-        |r| {
+        |r, _opts| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
 
@@ -1353,7 +1330,7 @@ proxier! {
         list_schedule_matching_times,
         ListScheduleMatchingTimesRequest,
         ListScheduleMatchingTimesResponse,
-        |r| {
+        |r, _opts| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
 
@@ -1364,7 +1341,7 @@ proxier! {
         delete_schedule,
         DeleteScheduleRequest,
         DeleteScheduleResponse,
-        |r| {
+        |r, _opts| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
         }
@@ -1373,7 +1350,7 @@ proxier! {
         list_schedules,
         ListSchedulesRequest,
         ListSchedulesResponse,
-        |r| {
+        |r, _opts| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
         }
@@ -1382,7 +1359,7 @@ proxier! {
         update_worker_build_id_compatibility,
         UpdateWorkerBuildIdCompatibilityRequest,
         UpdateWorkerBuildIdCompatibilityResponse,
-        |r| {
+        |r, _opts| {
             let mut labels = namespaced_request!(r);
             labels.task_q_str(r.get_ref().task_queue.clone());
             r.extensions_mut().insert(labels);
@@ -1392,7 +1369,7 @@ proxier! {
         get_worker_build_id_compatibility,
         GetWorkerBuildIdCompatibilityRequest,
         GetWorkerBuildIdCompatibilityResponse,
-        |r| {
+        |r, _opts| {
             let mut labels = namespaced_request!(r);
             labels.task_q_str(r.get_ref().task_queue.clone());
             r.extensions_mut().insert(labels);
@@ -1402,7 +1379,7 @@ proxier! {
         get_worker_task_reachability,
         GetWorkerTaskReachabilityRequest,
         GetWorkerTaskReachabilityResponse,
-        |r| {
+        |r, _opts| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
         }
@@ -1411,7 +1388,7 @@ proxier! {
         update_workflow_execution,
         UpdateWorkflowExecutionRequest,
         UpdateWorkflowExecutionResponse,
-        |r| {
+        |r, _opts| {
             let labels = namespaced_request!(r);
             let exts = r.extensions_mut();
             exts.insert(labels);
@@ -1422,7 +1399,7 @@ proxier! {
         poll_workflow_execution_update,
         PollWorkflowExecutionUpdateRequest,
         PollWorkflowExecutionUpdateResponse,
-        |r| {
+        |r, _opts| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
         }
@@ -1431,7 +1408,7 @@ proxier! {
         start_batch_operation,
         StartBatchOperationRequest,
         StartBatchOperationResponse,
-        |r| {
+        |r, _opts| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
         }
@@ -1440,7 +1417,7 @@ proxier! {
         stop_batch_operation,
         StopBatchOperationRequest,
         StopBatchOperationResponse,
-        |r| {
+        |r, _opts| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
         }
@@ -1449,7 +1426,7 @@ proxier! {
         describe_batch_operation,
         DescribeBatchOperationRequest,
         DescribeBatchOperationResponse,
-        |r| {
+        |r, _opts| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
         }
@@ -1458,7 +1435,7 @@ proxier! {
         describe_deployment,
         DescribeDeploymentRequest,
         DescribeDeploymentResponse,
-        |r| {
+        |r, _opts| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
         }
@@ -1467,7 +1444,7 @@ proxier! {
         list_batch_operations,
         ListBatchOperationsRequest,
         ListBatchOperationsResponse,
-        |r| {
+        |r, _opts| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
         }
@@ -1476,7 +1453,7 @@ proxier! {
         list_deployments,
         ListDeploymentsRequest,
         ListDeploymentsResponse,
-        |r| {
+        |r, _opts| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
         }
@@ -1485,7 +1462,7 @@ proxier! {
         execute_multi_operation,
         ExecuteMultiOperationRequest,
         ExecuteMultiOperationResponse,
-        |r| {
+        |r, _opts| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
         }
@@ -1494,7 +1471,7 @@ proxier! {
         get_current_deployment,
         GetCurrentDeploymentRequest,
         GetCurrentDeploymentResponse,
-        |r| {
+        |r, _opts| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
         }
@@ -1503,7 +1480,7 @@ proxier! {
         get_deployment_reachability,
         GetDeploymentReachabilityRequest,
         GetDeploymentReachabilityResponse,
-        |r| {
+        |r, _opts| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
         }
@@ -1512,7 +1489,7 @@ proxier! {
         get_worker_versioning_rules,
         GetWorkerVersioningRulesRequest,
         GetWorkerVersioningRulesResponse,
-        |r| {
+        |r, _opts| {
             let mut labels = namespaced_request!(r);
             labels.task_q_str(&r.get_ref().task_queue);
             r.extensions_mut().insert(labels);
@@ -1522,7 +1499,7 @@ proxier! {
         update_worker_versioning_rules,
         UpdateWorkerVersioningRulesRequest,
         UpdateWorkerVersioningRulesResponse,
-        |r| {
+        |r, _opts| {
             let mut labels = namespaced_request!(r);
             labels.task_q_str(&r.get_ref().task_queue);
             r.extensions_mut().insert(labels);
@@ -1532,7 +1509,7 @@ proxier! {
         poll_nexus_task_queue,
         PollNexusTaskQueueRequest,
         PollNexusTaskQueueResponse,
-        |r| {
+        |r, _opts| {
             let mut labels = namespaced_request!(r);
             labels.task_q(r.get_ref().task_queue.clone());
             r.extensions_mut().insert(labels);
@@ -1542,7 +1519,7 @@ proxier! {
         respond_nexus_task_completed,
         RespondNexusTaskCompletedRequest,
         RespondNexusTaskCompletedResponse,
-        |r| {
+        |r, _opts| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
         }
@@ -1551,7 +1528,7 @@ proxier! {
         respond_nexus_task_failed,
         RespondNexusTaskFailedRequest,
         RespondNexusTaskFailedResponse,
-        |r| {
+        |r, _opts| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
         }
@@ -1560,7 +1537,7 @@ proxier! {
         set_current_deployment,
         SetCurrentDeploymentRequest,
         SetCurrentDeploymentResponse,
-        |r| {
+        |r, _opts| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
         }
@@ -1569,7 +1546,7 @@ proxier! {
         shutdown_worker,
         ShutdownWorkerRequest,
         ShutdownWorkerResponse,
-        |r| {
+        |r, _opts| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
         }
@@ -1578,7 +1555,7 @@ proxier! {
         update_activity_options,
         UpdateActivityOptionsRequest,
         UpdateActivityOptionsResponse,
-        |r| {
+        |r, _opts| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
         }
@@ -1587,7 +1564,7 @@ proxier! {
         pause_activity,
         PauseActivityRequest,
         PauseActivityResponse,
-        |r| {
+        |r, _opts| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
         }
@@ -1596,7 +1573,7 @@ proxier! {
         unpause_activity,
         UnpauseActivityRequest,
         UnpauseActivityResponse,
-        |r| {
+        |r, _opts| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
         }
@@ -1605,7 +1582,7 @@ proxier! {
         update_workflow_execution_options,
         UpdateWorkflowExecutionOptionsRequest,
         UpdateWorkflowExecutionOptionsResponse,
-        |r| {
+        |r, _opts| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
         }
@@ -1614,7 +1591,7 @@ proxier! {
         reset_activity,
         ResetActivityRequest,
         ResetActivityResponse,
-        |r| {
+        |r, _opts| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
         }
@@ -1623,7 +1600,7 @@ proxier! {
         delete_worker_deployment,
         DeleteWorkerDeploymentRequest,
         DeleteWorkerDeploymentResponse,
-        |r| {
+        |r, _opts| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
         }
@@ -1632,7 +1609,7 @@ proxier! {
         delete_worker_deployment_version,
         DeleteWorkerDeploymentVersionRequest,
         DeleteWorkerDeploymentVersionResponse,
-        |r| {
+        |r, _opts| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
         }
@@ -1641,7 +1618,7 @@ proxier! {
         describe_worker_deployment,
         DescribeWorkerDeploymentRequest,
         DescribeWorkerDeploymentResponse,
-        |r| {
+        |r, _opts| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
         }
@@ -1650,7 +1627,7 @@ proxier! {
         describe_worker_deployment_version,
         DescribeWorkerDeploymentVersionRequest,
         DescribeWorkerDeploymentVersionResponse,
-        |r| {
+        |r, _opts| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
         }
@@ -1659,7 +1636,7 @@ proxier! {
         list_worker_deployments,
         ListWorkerDeploymentsRequest,
         ListWorkerDeploymentsResponse,
-        |r| {
+        |r, _opts| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
         }
@@ -1668,7 +1645,7 @@ proxier! {
         set_worker_deployment_current_version,
         SetWorkerDeploymentCurrentVersionRequest,
         SetWorkerDeploymentCurrentVersionResponse,
-        |r| {
+        |r, _opts| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
         }
@@ -1677,7 +1654,7 @@ proxier! {
         set_worker_deployment_ramping_version,
         SetWorkerDeploymentRampingVersionRequest,
         SetWorkerDeploymentRampingVersionResponse,
-        |r| {
+        |r, _opts| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
         }
@@ -1686,7 +1663,7 @@ proxier! {
         update_worker_deployment_version_metadata,
         UpdateWorkerDeploymentVersionMetadataRequest,
         UpdateWorkerDeploymentVersionMetadataResponse,
-        |r| {
+        |r, _opts| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
         }
@@ -1695,7 +1672,7 @@ proxier! {
         list_workers,
         ListWorkersRequest,
         ListWorkersResponse,
-        |r| {
+        |r, _opts| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
         }
@@ -1704,7 +1681,7 @@ proxier! {
         record_worker_heartbeat,
         RecordWorkerHeartbeatRequest,
         RecordWorkerHeartbeatResponse,
-        |r| {
+        |r, _opts| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
         }
@@ -1713,7 +1690,7 @@ proxier! {
         update_task_queue_config,
         UpdateTaskQueueConfigRequest,
         UpdateTaskQueueConfigResponse,
-        |r| {
+        |r, _opts| {
             let mut labels = namespaced_request!(r);
             labels.task_q_str(r.get_ref().task_queue.clone());
             r.extensions_mut().insert(labels);
@@ -1723,7 +1700,7 @@ proxier! {
         fetch_worker_config,
         FetchWorkerConfigRequest,
         FetchWorkerConfigResponse,
-        |r| {
+        |r, _opts| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
         }
@@ -1732,7 +1709,7 @@ proxier! {
         update_worker_config,
         UpdateWorkerConfigRequest,
         UpdateWorkerConfigResponse,
-        |r| {
+        |r, _opts| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
         }
@@ -1741,7 +1718,7 @@ proxier! {
         describe_worker,
         DescribeWorkerRequest,
         DescribeWorkerResponse,
-        |r| {
+        |r, _opts| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
         }
@@ -1750,7 +1727,7 @@ proxier! {
         set_worker_deployment_manager,
         SetWorkerDeploymentManagerRequest,
         SetWorkerDeploymentManagerResponse,
-        |r| {
+        |r, _opts| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
         }
@@ -1763,7 +1740,7 @@ proxier! {
     (remove_search_attributes, RemoveSearchAttributesRequest, RemoveSearchAttributesResponse);
     (list_search_attributes, ListSearchAttributesRequest, ListSearchAttributesResponse);
     (delete_namespace, DeleteNamespaceRequest, DeleteNamespaceResponse,
-        |r| {
+        |r, _opts| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
         }
@@ -1790,20 +1767,20 @@ proxier! {
     (create_namespace, cloudreq::CreateNamespaceRequest, cloudreq::CreateNamespaceResponse);
     (get_namespaces, cloudreq::GetNamespacesRequest, cloudreq::GetNamespacesResponse);
     (get_namespace, cloudreq::GetNamespaceRequest, cloudreq::GetNamespaceResponse,
-        |r| {
+        |r, _opts| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
         }
     );
     (update_namespace, cloudreq::UpdateNamespaceRequest, cloudreq::UpdateNamespaceResponse,
-        |r| {
+        |r, _opts| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
         }
     );
     (rename_custom_search_attribute, cloudreq::RenameCustomSearchAttributeRequest, cloudreq::RenameCustomSearchAttributeResponse);
     (delete_namespace, cloudreq::DeleteNamespaceRequest, cloudreq::DeleteNamespaceResponse,
-        |r| {
+        |r, _opts| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
         }
@@ -2100,6 +2077,9 @@ mod tests {
         impl RawClientProducer for MyFakeServices {
             fn get_workers_info(&self) -> Option<Arc<ClientWorkerSet>> {
                 Some(self.client_worker_set.clone())
+            }
+            fn get_payloads_options(&self) -> Option<Arc<crate::PayloadsOptions>> {
+                None
             }
             fn workflow_client(&mut self) -> Box<dyn WorkflowService> {
                 Box::new(MyFakeWfClient {
