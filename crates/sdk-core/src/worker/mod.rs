@@ -6,6 +6,7 @@ mod slot_provider;
 pub(crate) mod tuner;
 mod workflow;
 
+use temporalio_common::protos::temporal::api::namespace::v1::NamespaceInfo;
 pub use temporalio_common::worker::{WorkerConfig, WorkerConfigBuilder};
 pub use tuner::{
     FixedSizeSlotSupplier, ResourceBasedSlotsOptions, ResourceBasedSlotsOptionsBuilder,
@@ -164,9 +165,22 @@ pub(crate) struct WorkerTelemetry {
 
 #[async_trait::async_trait]
 impl WorkerTrait for Worker {
-    async fn validate(&self) -> Result<(), WorkerValidationError> {
-        self.verify_namespace_exists().await?;
-        Ok(())
+    async fn validate(&self) -> Result<Option<NamespaceInfo>, WorkerValidationError> {
+        let maybe_info = match self.client.describe_namespace().await {
+            Ok(r) => r.namespace_info,
+            Err(e) => {
+                // Ignore if unimplemented since we wouldn't want to fail against an old server, for
+                // example.
+                if e.code() != tonic::Code::Unimplemented {
+                    return Err(WorkerValidationError::NamespaceDescribeError {
+                        source: e,
+                        namespace: self.config.namespace.clone(),
+                    });
+                }
+                None
+            }
+        };
+        Ok(maybe_info)
     }
 
     async fn poll_workflow_activation(&self) -> Result<WorkflowActivation, PollError> {
@@ -1074,20 +1088,6 @@ impl Worker {
         } else {
             dbg_panic!("trying to notify local result when workflows not enabled for this worker");
         }
-    }
-
-    async fn verify_namespace_exists(&self) -> Result<(), WorkerValidationError> {
-        if let Err(e) = self.client.describe_namespace().await {
-            // Ignore if unimplemented since we wouldn't want to fail against an old server, for
-            // example.
-            if e.code() != tonic::Code::Unimplemented {
-                return Err(WorkerValidationError::NamespaceDescribeError {
-                    source: e,
-                    namespace: self.config.namespace.clone(),
-                });
-            }
-        }
-        Ok(())
     }
 }
 

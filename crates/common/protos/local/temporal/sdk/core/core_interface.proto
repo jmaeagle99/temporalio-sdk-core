@@ -10,6 +10,7 @@ import "google/protobuf/duration.proto";
 import "google/protobuf/empty.proto";
 import "google/protobuf/timestamp.proto";
 import "temporal/api/common/v1/message.proto";
+import "temporal/api/namespace/v1/message.proto";
 import "temporal/sdk/core/activity_result/activity_result.proto";
 import "temporal/sdk/core/activity_task/activity_task.proto";
 import "temporal/sdk/core/common/common.proto";
