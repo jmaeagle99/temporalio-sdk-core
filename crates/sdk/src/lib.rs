@@ -279,6 +279,10 @@ pub struct WorkerOptions {
     /// channels, etc.) will have their tasks failed with a descriptive error.
     #[builder(default = true)]
     pub detect_nondeterministic_futures: bool,
+    /// If true, skip the server-provided payload error limit check. Payloads that exceed the
+    /// server's hard limit will still be rejected by the server itself. Defaults to false.
+    #[builder(default = false)]
+    pub disable_payload_error_limit: bool,
 }
 
 impl<S: worker_options_builder::State> WorkerOptionsBuilder<S> {
@@ -418,6 +422,7 @@ impl WorkerOptions {
             ))
             .workflow_failure_errors(self.workflow_failure_errors.clone())
             .workflow_types_to_failure_errors(self.workflow_types_to_failure_errors.clone())
+            .disable_payload_error_limit(self.disable_payload_error_limit)
             .build()
     }
 }

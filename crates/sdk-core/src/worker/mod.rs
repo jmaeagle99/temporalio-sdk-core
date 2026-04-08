@@ -272,6 +272,11 @@ pub struct WorkerConfig {
     /// List of storage drivers used by lang.
     #[builder(default)]
     pub storage_drivers: HashSet<StorageDriverInfo>,
+
+    /// If true, skip payload size error-limit validation even when the server provides a limit.
+    #[builder(default = false)]
+    pub disable_payload_error_limit: bool,
+
 }
 
 impl WorkerConfig {
@@ -431,6 +436,10 @@ pub struct Worker {
     /// Set during validate() when the namespace has the poller_autoscaling capability,
     /// enabling scale-down on poll timeout even without an explicit scaling decision.
     poller_autoscaling: Arc<AtomicBool>,
+    /// Shared with the WorkerClient; updated by validate() with server-provided error limits.
+    payload_size_error_limit: Arc<AtomicU64>,
+    /// Shared with the WorkerClient; updated by validate() with server-provided error limits.
+    memo_size_error_limit: Arc<AtomicU64>,
 }
 
 struct AllPermitsTracker {
@@ -504,6 +513,19 @@ impl Worker {
                         memo_size_limit_error: api_limits.memo_size_limit_error,
                     })
                 });
+                // Store server-provided error limits for payload size enforcement
+                if !self.config.disable_payload_error_limit {
+                    if let Some(ref lims) = limits {
+                        if lims.blob_size_limit_error > 0 {
+                            self.payload_size_error_limit
+                                .store(lims.blob_size_limit_error as u64, Ordering::Relaxed);
+                        }
+                        if lims.memo_size_limit_error > 0 {
+                            self.memo_size_error_limit
+                                .store(lims.memo_size_limit_error as u64, Ordering::Relaxed);
+                        }
+                    }
+                }
                 if let Some(caps) = ns_info.and_then(|ns| ns.capabilities) {
                     if caps.worker_poll_complete_on_shutdown {
                         self.graceful_poll_shutdown.store(true, Ordering::Relaxed);
@@ -634,6 +656,7 @@ impl Worker {
         let nexus_last_suc_poll_time = Arc::new(AtomicCell::new(None));
         let graceful_poll_shutdown = Arc::new(AtomicBool::new(false));
         let poller_autoscaling = Arc::new(AtomicBool::new(false));
+        let (payload_size_error_limit, memo_size_error_limit) = client.payload_error_limits();
 
         let nexus_slots = MeteredPermitDealer::new(
             tuner.nexus_task_slot_supplier(),
@@ -927,6 +950,8 @@ impl Worker {
             status: worker_status,
             graceful_poll_shutdown,
             poller_autoscaling,
+            payload_size_error_limit,
+            memo_size_error_limit,
         })
     }
 

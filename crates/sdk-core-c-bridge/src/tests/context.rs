@@ -354,6 +354,8 @@ impl Context {
             http_connect_proxy_options: pointer_or_null(proxy_options.as_deref()),
             grpc_override_callback,
             grpc_override_callback_user_data,
+            payload_size_warn_limit: 0,
+            memo_size_warn_limit: 0,
         });
 
         let client_options_ptr = &*client_options as *const _;

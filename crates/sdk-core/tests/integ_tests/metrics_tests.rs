@@ -72,7 +72,8 @@ use temporalio_sdk::{
 use temporalio_sdk_core::{
     CoreRuntime, FixedSizeSlotSupplier, PollError, PollerBehavior, SlotKind, SlotMarkUsedContext,
     SlotReleaseContext, SlotReservationContext, SlotSupplier, SlotSupplierPermit,
-    TokioRuntimeBuilder, TunerBuilder, WorkerConfig, WorkerVersioningStrategy, WorkflowSlotKind,
+    TokioRuntimeBuilder, TunerBuilder, WorkerConfig, WorkerVersioningStrategy,
+    WorkflowSlotKind, WorkflowTaskCompletionError,
     init_worker,
     replay::TestHistoryBuilder,
     test_help::{
@@ -1632,7 +1633,9 @@ async fn terminal_metric_not_recorded_on_rejected_completion() {
     mh.completion_mock_fn = Some(Box::new(move |_| {
         call_count += 1;
         if call_count == 1 {
-            Err(tonic::Status::not_found("Workflow task not found"))
+            Err(WorkflowTaskCompletionError::Rpc(tonic::Status::not_found(
+                "Workflow task not found",
+            )))
         } else {
             Ok(Default::default())
         }

@@ -16,6 +16,7 @@ pub mod errors;
 pub mod grpc;
 mod metrics;
 mod options_structs;
+mod payload_check;
 /// Visible only for tests
 #[doc(hidden)]
 pub mod proxy;
@@ -28,6 +29,7 @@ pub mod worker;
 mod workflow_handle;
 
 pub use crate::{
+    payload_check::{LimitExceeded, LimitSeverity, PayloadLimitResult, check_payload_limits},
     proxy::HttpConnectProxyOptions,
     retry::{CallType, RETRYABLE_ERROR_CODES},
 };
@@ -143,6 +145,10 @@ struct ConnectionInner {
     /// Capabilities as read from the `get_system_info` RPC call made on client connection
     capabilities: Option<get_system_info_response::Capabilities>,
     workers: Arc<ClientWorkerSet>,
+    /// Payload size warning threshold in bytes.
+    payload_size_warn_limit: u64,
+    /// Memo size warning threshold in bytes.
+    memo_size_warn_limit: u64,
 }
 
 impl Connection {
@@ -224,8 +230,20 @@ impl Connection {
                 client_version: options.client_version,
                 capabilities,
                 workers: Arc::new(ClientWorkerSet::new()),
+                payload_size_warn_limit: options.payload_size_warn_limit,
+                memo_size_warn_limit: options.memo_size_warn_limit,
             }),
         })
+    }
+
+    /// Returns the payload size warning threshold configured for this connection in bytes.
+    pub fn payload_size_warn_limit(&self) -> u64 {
+        self.inner.payload_size_warn_limit
+    }
+
+    /// Returns the memo size warning threshold configured for this connection in bytes.
+    pub fn memo_size_warn_limit(&self) -> u64 {
+        self.inner.memo_size_warn_limit
     }
 
     /// Set API key, overwriting any previous one.

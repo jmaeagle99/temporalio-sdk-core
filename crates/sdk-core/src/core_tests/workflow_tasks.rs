@@ -13,7 +13,10 @@ use crate::{
     worker::{
         PollerBehavior, SlotMarkUsedContext, SlotReleaseContext, SlotReservationContext,
         SlotSupplier, SlotSupplierPermit, TunerBuilder, WorkflowSlotKind,
-        client::mocks::{mock_manual_worker_client, mock_worker_client},
+        client::{
+            WorkflowTaskCompletionError, WorkflowTaskCompletionSuccess,
+            mocks::{mock_manual_worker_client, mock_worker_client},
+        },
     },
 };
 use futures_util::{FutureExt, stream};
@@ -1189,7 +1192,7 @@ async fn buffered_work_drained_on_shutdown() {
     );
     let mut mock = mock_worker_client();
     mock.expect_complete_workflow_task()
-        .returning(|_| Ok(RespondWorkflowTaskCompletedResponse::default()));
+        .returning(|_| Ok(WorkflowTaskCompletionSuccess::default()));
     let mut mock = MocksHolder::from_wft_stream(mock, stream::iter(tasks));
     // Cache on to avoid being super repetitive
     mock.worker_cfg(|wc| wc.max_cached_workflows = 10);
@@ -1363,7 +1366,7 @@ async fn lang_slower_than_wft_timeouts() {
     let mut mock = mock_worker_client();
     mock.expect_complete_workflow_task()
         .times(1)
-        .returning(|_| Err(tonic::Status::not_found("Workflow task not found.")));
+        .returning(|_| Err(WorkflowTaskCompletionError::Rpc(tonic::Status::not_found("Workflow task not found."))));
     mock.expect_complete_workflow_task()
         .times(1)
         .returning(|_| Ok(Default::default()));
@@ -1660,12 +1663,11 @@ async fn tasks_from_completion_are_delivered() {
     let mut mock = mock_worker_client();
     let complete_resp = RespondWorkflowTaskCompletedResponse {
         workflow_task: Some(hist_to_poll_resp(&t, wfid.to_owned(), 2.into()).resp),
-        activity_tasks: vec![],
-        reset_history_event_id: 0,
+        ..Default::default()
     };
     mock.expect_complete_workflow_task()
         .times(1)
-        .returning(move |_| Ok(complete_resp.clone()));
+        .returning(move |_| Ok(WorkflowTaskCompletionSuccess { response: complete_resp.clone(), ..Default::default() }));
     mock.expect_complete_workflow_task()
         .times(1)
         .returning(|_| Ok(Default::default()));
@@ -1711,7 +1713,7 @@ async fn pagination_works_with_tasks_from_completion() {
     };
     mock.expect_complete_workflow_task()
         .times(1)
-        .returning(move |_| Ok(complete_resp.clone()));
+        .returning(move |_| Ok(WorkflowTaskCompletionSuccess { response: complete_resp.clone(), ..Default::default() }));
     mock.expect_complete_workflow_task()
         .times(1)
         .returning(|_| Ok(Default::default()));
@@ -3104,7 +3106,7 @@ async fn grpc_message_too_large_doesnt_spam_task_fails() {
             // This key is what we look for
             err.metadata_mut().insert(MESSAGE_TOO_LARGE_KEY, 1.into());
             times += 1;
-            Err(err)
+            Err(WorkflowTaskCompletionError::Rpc(err))
         } else {
             Ok(Default::default())
         }

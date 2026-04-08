@@ -16,7 +16,10 @@ use crate::{
     sticky_q_name_for_worker,
     worker::{
         TaskPollers, WorkerTelemetry,
-        client::{LegacyQueryResult, MockWorkerClient, WorkerClient, WorkflowTaskCompletion},
+        client::{
+            LegacyQueryResult, MockWorkerClient, WorkerClient, WorkflowTaskCompletion,
+            WorkflowTaskCompletionError, WorkflowTaskCompletionSuccess,
+        },
         worker_config_builder,
     },
 };
@@ -54,7 +57,7 @@ use temporalio_common::{
             update,
             workflowservice::v1::{
                 PollActivityTaskQueueResponse, PollNexusTaskQueueResponse,
-                PollWorkflowTaskQueueResponse, RespondWorkflowTaskCompletedResponse,
+                PollWorkflowTaskQueueResponse,
             },
         },
         utilities::pack_any,
@@ -502,8 +505,8 @@ pub fn single_hist_mock_sg(
     build_mock_pollers(mh)
 }
 
-type WFTCompletionMockFn = dyn FnMut(&WorkflowTaskCompletion) -> Result<RespondWorkflowTaskCompletedResponse, tonic::Status>
-    + Send;
+type WFTCompletionMockFn =
+    dyn FnMut(&WorkflowTaskCompletion) -> Result<WorkflowTaskCompletionSuccess, WorkflowTaskCompletionError> + Send;
 
 #[allow(clippy::type_complexity)]
 pub struct MockPollCfg {
@@ -809,7 +812,7 @@ pub fn build_mock_pollers(mut cfg: MockPollCfg) -> MocksHolder {
             // tee hee
             ass(&comp)
         } else {
-            Ok(RespondWorkflowTaskCompletedResponse::default())
+            Ok(WorkflowTaskCompletionSuccess::default())
         };
         outstanding.release_token(&comp.task_token);
         r

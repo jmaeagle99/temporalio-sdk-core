@@ -23,11 +23,8 @@ use temporalio_common::{
     protos::{
         coresdk::workflow_activation::remove_from_cache::EvictionReason,
         temporal::api::{
-            common::v1::WorkflowExecution,
-            history::v1::History,
-            workflowservice::v1::{
-                RespondWorkflowTaskCompletedResponse, RespondWorkflowTaskFailedResponse,
-            },
+            common::v1::WorkflowExecution, history::v1::History,
+            workflowservice::v1::RespondWorkflowTaskFailedResponse,
         },
     },
     worker::WorkerTaskTypes,
@@ -108,9 +105,9 @@ where
             .boxed()
         });
 
-        client.expect_complete_workflow_task().returning(move |_a| {
-            async move { Ok(RespondWorkflowTaskCompletedResponse::default()) }.boxed()
-        });
+        client
+            .expect_complete_workflow_task()
+            .returning(move |_a| async move { Ok(Default::default()) }.boxed());
         client
             .expect_fail_workflow_task()
             .returning(move |_, _, _| {

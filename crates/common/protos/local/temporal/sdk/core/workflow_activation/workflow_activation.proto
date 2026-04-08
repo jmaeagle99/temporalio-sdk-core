@@ -403,6 +403,8 @@ message RemoveFromCache {
         // The workflow is being completed with a terminal command and we sent the WFT completion
         // to server successfully.
         WORKFLOW_EXECUTION_ENDING = 10;
+        // WFT completion rejected due to payload size limit; RespondWorkflowTaskFailed already sent.
+        PAYLOADS_TOO_LARGE = 11;
     }
     EvictionReason reason = 2;
 }

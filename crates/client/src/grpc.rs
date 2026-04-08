@@ -226,7 +226,12 @@ impl RawClientProducer for Connection {
     }
 
     fn workflow_client(&mut self) -> Box<dyn WorkflowService> {
-        self.inner.service.workflow_service()
+        let svc = self.inner.service.workflow_service();
+        Box::new(crate::payload_check::PayloadCheckingWorkflowService {
+            inner: svc,
+            payload_warn: self.inner.payload_size_warn_limit,
+            memo_warn: self.inner.memo_size_warn_limit,
+        })
     }
 
     fn operator_client(&mut self) -> Box<dyn OperatorService> {

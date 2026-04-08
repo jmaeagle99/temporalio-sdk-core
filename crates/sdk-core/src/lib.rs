@@ -35,7 +35,9 @@ mod core_tests;
 pub mod test_help;
 
 pub use crate::worker::client::{
+    ActivityTaskCompletionError, ActivityTaskCompletionResult, ActivityTaskCompletionSuccess,
     PollActivityOptions, PollOptions, PollWorkflowOptions, WorkerClient, WorkflowTaskCompletion,
+    WorkflowTaskCompletionError, WorkflowTaskCompletionSuccess,
 };
 pub use pollers::{Client, ClientOptions, ClientTlsOptions, RetryOptions, TlsOptions};
 pub use temporalio_common::protos::TaskToken;
@@ -92,6 +94,8 @@ pub fn init_worker(
         &mut connection,
         worker_config.client_identity_override.clone(),
     );
+    let payload_size_warn_limit = connection.payload_size_warn_limit();
+    let memo_size_warn_limit = connection.memo_size_warn_limit();
     let client = SharedReplaceableClient::new(connection);
     let client_ident = client.inner_cow().identity().to_owned();
     if client_ident.is_empty() {
@@ -105,6 +109,8 @@ pub fn init_worker(
         namespace.clone(),
         worker_config.versioning_strategy.clone(),
         worker_instance_key,
+        payload_size_warn_limit,
+        memo_size_warn_limit,
     ));
 
     Worker::new(

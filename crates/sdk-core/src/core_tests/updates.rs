@@ -4,7 +4,7 @@ use crate::{
         MockPollCfg, PollWFTRespExt, ResponseType, WorkerTestHelpers, build_mock_pollers,
         hist_to_poll_resp, mock_worker,
     },
-    worker::client::mocks::mock_worker_client,
+    worker::client::{WorkflowTaskCompletionSuccess, mocks::mock_worker_client},
 };
 use temporalio_common::protos::{
     DEFAULT_ACTIVITY_TYPE, TestHistoryBuilder,
@@ -20,7 +20,6 @@ use temporalio_common::protos::{
         common::v1::Payload,
         enums::v1::EventType,
         update::v1::{Acceptance, Rejection},
-        workflowservice::v1::RespondWorkflowTaskCompletedResponse,
     },
 };
 
@@ -120,7 +119,7 @@ async fn initial_request_sent_back(#[values(false, true)] reject: bool) {
                 acceptance.accepted_request.unwrap()
             };
             assert_eq!(orig_req, upd_req_body);
-            Ok(RespondWorkflowTaskCompletedResponse::default())
+            Ok(WorkflowTaskCompletionSuccess::default())
         });
     let mh = MockPollCfg::from_resp_batches(wfid, t, [poll_resp], mock_client);
     let mut mock = build_mock_pollers(mh);
@@ -183,11 +182,11 @@ async fn speculative_wft_with_command_event() {
     let mut completes = 0;
     mh.completion_mock_fn = Some(Box::new(move |_| {
         completes += 1;
-        let mut r = RespondWorkflowTaskCompletedResponse::default();
+        let mut r = WorkflowTaskCompletionSuccess::default();
         if completes == 2 {
             // The second response (the update rejection) needs to indicate that the last started
             // wft ID should be reset.
-            r.reset_history_event_id = 3;
+            r.response.reset_history_event_id = 3;
         }
         Ok(r)
     }));

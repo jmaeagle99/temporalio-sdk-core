@@ -8,7 +8,11 @@ use crate::{
     },
     worker::{
         PollerBehavior,
-        client::mocks::{mock_manual_worker_client, mock_worker_client},
+        client::{
+            ActivityTaskCompletionError, ActivityTaskCompletionSuccess,
+            WorkflowTaskCompletionSuccess,
+            mocks::{mock_manual_worker_client, mock_worker_client},
+        },
     },
 };
 use futures_util::FutureExt;
@@ -48,8 +52,8 @@ use temporalio_common::{
             enums::v1::EventType,
             workflowservice::v1::{
                 PollActivityTaskQueueResponse, RecordActivityTaskHeartbeatResponse,
-                RespondActivityTaskCanceledResponse, RespondActivityTaskCompletedResponse,
-                RespondActivityTaskFailedResponse, RespondWorkflowTaskCompletedResponse,
+                RespondActivityTaskCanceledResponse, RespondActivityTaskFailedResponse,
+                RespondWorkflowTaskCompletedResponse,
             },
         },
         test_utils::start_timer_cmd,
@@ -90,7 +94,7 @@ async fn max_activities_respected() {
         .returning(move |_, _| Ok(tasks.pop_front().unwrap()));
     mock_client
         .expect_complete_activity_task()
-        .returning(|_, _| Ok(RespondActivityTaskCompletedResponse::default()));
+        .returning(|_, _| Ok(ActivityTaskCompletionSuccess::default()));
 
     let worker = Worker::new_test(
         test_worker_cfg()
@@ -150,7 +154,7 @@ async fn heartbeats_report_cancels_only_once() {
     mock_client
         .expect_complete_activity_task()
         .times(1)
-        .returning(|_, _| Ok(RespondActivityTaskCompletedResponse::default()));
+        .returning(|_, _| Ok(ActivityTaskCompletionSuccess::default()));
     mock_client
         .expect_cancel_activity_task()
         .times(1)
@@ -279,7 +283,7 @@ async fn activity_cancel_interrupts_poll() {
     mock_client
         .expect_complete_activity_task()
         .times(1)
-        .returning(|_, _| async { Ok(RespondActivityTaskCompletedResponse::default()) }.boxed());
+        .returning(|_, _| async { Ok(ActivityTaskCompletionSuccess::default()) }.boxed());
 
     let mw = MockWorkerInputs {
         act_poller: Some(Box::from(mock_poller)),
@@ -619,7 +623,7 @@ async fn can_heartbeat_acts_during_shutdown() {
     mock_client
         .expect_complete_activity_task()
         .times(1)
-        .returning(|_, _| Ok(RespondActivityTaskCompletedResponse::default()));
+        .returning(|_, _| Ok(ActivityTaskCompletionSuccess::default()));
 
     let core = mock_worker(MocksHolder::from_client_with_activities(
         mock_client,
@@ -745,7 +749,7 @@ async fn max_worker_acts_per_second_respected() {
         });
     mock_client
         .expect_complete_activity_task()
-        .returning(|_, _| Ok(RespondActivityTaskCompletedResponse::default()));
+        .returning(|_, _| Ok(ActivityTaskCompletionSuccess::default()));
 
     let cfg = test_worker_cfg()
         .activity_task_poller_behavior(PollerBehavior::SimpleMaximum(1_usize))
@@ -808,11 +812,7 @@ async fn no_eager_activities_requested_when_worker_options_disable_it(
                 })
                 .count();
             num_eager_requested_clone.store(count, Ordering::Relaxed);
-            Ok(RespondWorkflowTaskCompletedResponse {
-                workflow_task: None,
-                activity_tasks: vec![],
-                reset_history_event_id: 0,
-            })
+            Ok(WorkflowTaskCompletionSuccess::default())
         });
     let mut mock = single_hist_mock_sg(wfid, t, [1], mock, true);
     mock.worker_cfg(|wc| {
@@ -896,21 +896,23 @@ async fn activity_tasks_from_completion_are_delivered() {
                 })
                 .count();
             num_eager_requested_clone.store(count, Ordering::Relaxed);
-            Ok(RespondWorkflowTaskCompletedResponse {
-                workflow_task: None,
-                activity_tasks: (1..4)
-                    .map(|i| PollActivityTaskQueueResponse {
-                        task_token: vec![i],
-                        activity_id: format!("act_id_{i}_same_queue"),
-                        ..Default::default()
-                    })
-                    .collect_vec(),
-                reset_history_event_id: 0,
+            Ok(WorkflowTaskCompletionSuccess {
+                response: RespondWorkflowTaskCompletedResponse {
+                    activity_tasks: (1..4)
+                        .map(|i| PollActivityTaskQueueResponse {
+                            task_token: vec![i],
+                            activity_id: format!("act_id_{i}_same_queue"),
+                            ..Default::default()
+                        })
+                        .collect_vec(),
+                    ..Default::default()
+                },
+                ..Default::default()
             })
         });
     mock.expect_complete_activity_task()
         .times(3)
-        .returning(|_, _| Ok(RespondActivityTaskCompletedResponse::default()));
+        .returning(|_, _| Ok(ActivityTaskCompletionSuccess::default()));
     let act_tasks: Vec<QueueResponse<PollActivityTaskQueueResponse>> = vec![];
     let mut mh = MockPollCfg::from_resp_batches(wfid, t, [1], mock);
     mh.enforce_correct_number_of_polls = true;
@@ -987,7 +989,7 @@ async fn retryable_net_error_exhaustion_is_nonfatal() {
     mock_client
         .expect_complete_activity_task()
         .times(1)
-        .returning(|_, _| Err(tonic::Status::internal("retryable error")));
+        .returning(|_, _| Err(ActivityTaskCompletionError::Rpc(tonic::Status::internal("retryable error"))));
 
     let core = mock_worker(MocksHolder::from_client_with_activities(
         mock_client,

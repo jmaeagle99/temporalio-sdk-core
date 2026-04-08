@@ -14,6 +14,7 @@ mod workflow_stream;
 pub(crate) use driven_workflow::DrivenWorkflow;
 pub(crate) use history_update::HistoryUpdate;
 
+use crate::worker::client::WorkflowTaskCompletionError;
 use crate::{
     MetricsContext, WorkerConfig,
     abstractions::{
@@ -115,6 +116,7 @@ type InternalFlagsRef = Rc<RefCell<InternalFlags>>;
 
 /// Centralizes all state related to workflows and workflow tasks
 pub(crate) struct Workflows {
+    namespace: String,
     task_queue: String,
     local_tx: UnboundedSender<LocalInput>,
     processing_task: TakeCell<thread::JoinHandle<()>>,
@@ -176,6 +178,7 @@ impl Workflows {
         let (local_tx, local_rx) = unbounded_channel();
         let (fetch_tx, fetch_rx) = unbounded_channel();
         let shutdown_tok = basics.shutdown_token.clone();
+        let namespace = basics.worker_config.namespace.clone();
         let task_queue = basics.worker_config.task_queue.clone();
         let metrics = basics.metrics.clone();
         let default_versioning_behavior = basics.default_versioning_behavior;
@@ -255,6 +258,7 @@ impl Workflows {
             })
             .expect("Must be able to spawn workflow processing thread");
         Self {
+            namespace,
             task_queue,
             local_tx,
             processing_task: TakeCell::new(processing_task),
@@ -353,6 +357,8 @@ impl Workflows {
                         attempt,
                     },
                 metrics: run_metrics,
+                workflow_id,
+                workflow_type,
             } => {
                 let reserved_act_permits =
                     self.reserve_activity_slots_for_outgoing_commands(commands.as_mut_slice());
@@ -396,24 +402,39 @@ impl Workflows {
                 let mut reset_last_started_to = None;
                 self.handle_wft_reporting_errs(run_id, || async {
                     match self.client.complete_workflow_task(completion).await {
-                        Ok(response) => {
+                        Ok(success) => {
+                            if let Some(limit_exceeded) = success.warn_exceeded {
+                                warn!(
+                                    namespace = self.namespace,
+                                    worker_id = self.client.identity(),
+                                    workflow_type,
+                                    workflow_id,
+                                    run_id,
+                                    attempt,
+                                    payload_size = limit_exceeded.size,
+                                    payload_size_limit = limit_exceeded.limit,
+                                    "{}",
+                                    limit_exceeded.message(),
+                                );
+                            }
                             if let Some(record) = maybe_record_terminal_metric.take() {
                                 record(&run_metrics);
                             }
-                            if response.reset_history_event_id > 0 {
-                                reset_last_started_to = Some(response.reset_history_event_id);
+                            if success.response.reset_history_event_id > 0 {
+                                reset_last_started_to =
+                                    Some(success.response.reset_history_event_id);
                             }
-                            if let Some(wft) = response.workflow_task {
+                            if let Some(wft) = success.response.workflow_task {
                                 *wft_from_complete = Some(validate_wft(wft)?);
                             }
                             self.handle_eager_activities(
                                 reserved_act_permits,
-                                response.activity_tasks,
+                                success.response.activity_tasks,
                             );
                         }
                         // Reply with a task failure if we got grpc too large from server, but
                         // not if this is a nonfirst attempt to avoid spamming.
-                        Err(e)
+                        Err(WorkflowTaskCompletionError::Rpc(e))
                             if e.metadata().contains_key(MESSAGE_TOO_LARGE_KEY) && attempt < 2 =>
                         {
                             let failure = Failure {
@@ -444,10 +465,34 @@ impl Workflows {
                                     FailureReason::GrpcMessageTooLarge,
                                 )])
                                 .wf_task_failed();
-                            return Err(e);
+                            return Err(WorkflowTaskCompletionError::Rpc(e));
                         }
-                        e => {
-                            e?;
+                        // Payload size limit was exceeded — the client layer already sent a task
+                        // failure to the server, so we only need to update metrics and log here.
+                        Err(WorkflowTaskCompletionError::PayloadsTooLarge(ref limit_exceeded)) => {
+                            warn!(
+                                namespace = self.namespace,
+                                worker_id = self.client.identity(),
+                                workflow_type,
+                                workflow_id,
+                                run_id,
+                                attempt,
+                                payload_size = limit_exceeded.size,
+                                payload_size_limit = limit_exceeded.limit,
+                                "{}",
+                                limit_exceeded.message(),
+                            );
+                            self.metrics
+                                .with_new_attrs([metrics::failure_reason(
+                                    FailureReason::PayloadsTooLarge,
+                                )])
+                                .wf_task_failed();
+                            return Err(WorkflowTaskCompletionError::PayloadsTooLarge(
+                                limit_exceeded.clone(),
+                            ));
+                        }
+                        Err(e) => {
+                            Err(e)?;
                         }
                     };
 
@@ -487,6 +532,7 @@ impl Workflows {
                     self.client
                         .fail_workflow_task(tt, cause, failure.failure)
                         .await
+                        .map_err(WorkflowTaskCompletionError::Rpc)
                 })
                 .await;
                 WFTReportStatus::Reported {
@@ -715,25 +761,32 @@ impl Workflows {
     /// trigger a workflow eviction and are logged.
     async fn handle_wft_reporting_errs<T, Fut>(&self, run_id: &str, completer: impl FnOnce() -> Fut)
     where
-        Fut: Future<Output = Result<T, tonic::Status>>,
+        Fut: Future<Output = Result<T, WorkflowTaskCompletionError>>,
     {
         let mut should_evict = None;
         if let Err(err) = completer().await {
-            match err.code() {
-                // Silence unhandled command errors since the lang SDK cannot do anything
-                // about them besides poll again, which it will do anyway.
-                tonic::Code::InvalidArgument if err.message() == "UnhandledCommand" => {
-                    debug!(error = %err, run_id, "Unhandled command response when completing");
-                    should_evict = Some(EvictionReason::UnhandledCommand);
+            match err {
+                WorkflowTaskCompletionError::PayloadsTooLarge(_) => {
+                    // Server will retry on the normal (non-sticky) queue, so the cached state
+                    // is unlikely to be reused. Evict to free the slot.
+                    should_evict = Some(EvictionReason::PayloadsTooLarge);
                 }
-                tonic::Code::NotFound => {
-                    warn!(error = %err, run_id, "Task not found when completing");
-                    should_evict = Some(EvictionReason::TaskNotFound);
-                }
-                _ => {
-                    warn!(error= %err, "Error while completing workflow activation");
-                    should_evict = Some(EvictionReason::Fatal);
-                }
+                WorkflowTaskCompletionError::Rpc(err) => match err.code() {
+                    // Silence unhandled command errors since the lang SDK cannot do anything
+                    // about them besides poll again, which it will do anyway.
+                    tonic::Code::InvalidArgument if err.message() == "UnhandledCommand" => {
+                        debug!(error = %err, run_id, "Unhandled command response when completing");
+                        should_evict = Some(EvictionReason::UnhandledCommand);
+                    }
+                    tonic::Code::NotFound => {
+                        warn!(error = %err, run_id, "Task not found when completing");
+                        should_evict = Some(EvictionReason::TaskNotFound);
+                    }
+                    _ => {
+                        warn!(error = %err, "Error while completing workflow activation");
+                        should_evict = Some(EvictionReason::Fatal);
+                    }
+                },
             }
         }
         if let Some(reason) = should_evict {
@@ -1051,12 +1104,16 @@ struct ServerCommandsWithWorkflowInfo {
     task_token: TaskToken,
     action: ActivationAction,
     metrics: MetricsContext,
+    workflow_id: String,
+    workflow_type: String,
 }
 impl Debug for ServerCommandsWithWorkflowInfo {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ServerCommandsWithWorkflowInfo")
             .field("task_token", &self.task_token)
             .field("action", &self.action)
+            .field("workflow_id", &self.workflow_id)
+            .field("workflow_type", &self.workflow_type)
             .finish()
     }
 }

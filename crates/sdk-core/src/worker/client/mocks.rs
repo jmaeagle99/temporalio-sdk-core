@@ -1,6 +1,6 @@
 use super::*;
 use futures_util::{Future, FutureExt};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, atomic::AtomicU64};
 use temporalio_client::worker::ClientWorkerSet;
 
 pub(crate) static DEFAULT_WORKERS_REGISTRY: LazyLock<Arc<ClientWorkerSet>> =
@@ -33,6 +33,8 @@ pub fn mock_worker_client() -> MockWorkerClient {
         .returning(|_, _, _, _| Ok(ShutdownWorkerResponse {}));
     r.expect_sdk_name_and_version()
         .returning(|| ("test-core".to_string(), "0.0.0".to_string()));
+    r.expect_namespace()
+        .returning(|| "test-namespace".to_string());
     r.expect_identity()
         .returning(|| "test-identity".to_string());
     r.expect_worker_grouping_key().returning(Uuid::new_v4);
@@ -43,6 +45,8 @@ pub fn mock_worker_client() -> MockWorkerClient {
         hb.worker_identity = "test-identity".to_string();
         hb.heartbeat_time = Some(SystemTime::now().into());
     });
+    r.expect_payload_error_limits()
+        .returning(|| (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0))));
     r
 }
 
@@ -58,10 +62,14 @@ pub(crate) fn mock_manual_worker_client() -> MockManualWorkerClient {
         .returning(|_, _, _, _| async { Ok(ShutdownWorkerResponse {}) }.boxed());
     r.expect_sdk_name_and_version()
         .returning(|| ("test-core".to_string(), "0.0.0".to_string()));
+    r.expect_namespace()
+        .returning(|| "test-namespace".to_string());
     r.expect_identity()
         .returning(|| "test-identity".to_string());
     r.expect_worker_grouping_key().returning(Uuid::new_v4);
     r.expect_worker_instance_key().returning(Uuid::new_v4);
+    r.expect_payload_error_limits()
+        .returning(|| (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0))));
     r
 }
 
@@ -87,14 +95,14 @@ mockall::mock! {
         fn complete_workflow_task<'a, 'b>(
             &self,
             request: WorkflowTaskCompletion,
-        ) -> impl Future<Output = Result<RespondWorkflowTaskCompletedResponse>> + Send + 'b
+        ) -> impl Future<Output = WorkflowTaskCompletionResult> + Send + 'b
             where 'a: 'b, Self: 'b;
 
         fn complete_activity_task<'a, 'b>(
             &self,
             task_token: TaskToken,
             result: Option<Payloads>,
-        ) -> impl Future<Output = Result<RespondActivityTaskCompletedResponse>> + Send + 'b
+        ) -> impl Future<Output = ActivityTaskCompletionResult> + Send + 'b
             where 'a: 'b, Self: 'b;
 
         fn complete_nexus_task<'a, 'b>(
@@ -173,9 +181,11 @@ mockall::mock! {
         fn workers(&self) -> Arc<ClientWorkerSet>;
         fn is_mock(&self) -> bool;
         fn sdk_name_and_version(&self) -> (String, String);
+        fn namespace(&self) -> String;
         fn identity(&self) -> String;
         fn worker_grouping_key(&self) -> Uuid;
         fn worker_instance_key(&self) -> Uuid;
         fn set_heartbeat_client_fields(&self, heartbeat: &mut WorkerHeartbeat);
+        fn payload_error_limits(&self) -> (Arc<AtomicU64>, Arc<AtomicU64>);
     }
 }

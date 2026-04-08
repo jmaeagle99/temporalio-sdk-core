@@ -5,7 +5,7 @@ use crate::{
     },
     worker::{
         LEGACY_QUERY_ID, WorkerVersioningStrategy,
-        client::{LegacyQueryResult, mocks::mock_worker_client},
+        client::{LegacyQueryResult, WorkflowTaskCompletionSuccess, mocks::mock_worker_client},
     },
 };
 use futures_util::stream;
@@ -37,7 +37,7 @@ use temporalio_common::protos::{
         history::v1::{ActivityTaskCancelRequestedEventAttributes, History, history_event},
         query::v1::WorkflowQuery,
         workflowservice::v1::{
-            GetWorkflowExecutionHistoryResponse, RespondWorkflowTaskCompletedResponse,
+            GetWorkflowExecutionHistoryResponse,
         },
     },
     test_utils::{query_ok, schedule_activity_cmd, start_timer_cmd},
@@ -473,7 +473,7 @@ async fn query_cache_miss_causes_page_fetch_dont_reply_wft_too_early(
             assert_eq!(resp.commands.len(), 1);
             assert_eq!(resp.query_responses.len(), 1);
 
-            Ok(RespondWorkflowTaskCompletedResponse::default())
+            Ok(WorkflowTaskCompletionSuccess::default())
         });
 
     let mut mock = single_hist_mock_sg(wfid, t, tasks, mock_client, true);
@@ -553,7 +553,7 @@ async fn query_replay_with_continue_as_new_doesnt_reply_empty_command() {
             // Verify both the complete command and the query response are sent
             assert_eq!(resp.commands.len(), 1);
             assert_eq!(resp.query_responses.len(), 1);
-            Ok(RespondWorkflowTaskCompletedResponse::default())
+            Ok(WorkflowTaskCompletionSuccess::default())
         });
 
     let mut mock = single_hist_mock_sg(wfid, t, tasks, mock_client, true);
@@ -763,7 +763,7 @@ async fn new_query_fail() {
                     ..
                 }]
             );
-            Ok(RespondWorkflowTaskCompletedResponse::default())
+            Ok(WorkflowTaskCompletionSuccess::default())
         });
 
     let mut mock = single_hist_mock_sg(wfid, t, tasks, mock_client, true);

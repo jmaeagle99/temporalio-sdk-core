@@ -7,7 +7,8 @@ use crate::{
     worker::{
         self, PollerBehavior,
         client::{
-            MockWorkerClient,
+            ActivityTaskCompletionSuccess, MockWorkerClient, WorkflowTaskCompletionError,
+            WorkflowTaskCompletionSuccess,
             mocks::{DEFAULT_TEST_CAPABILITIES, DEFAULT_WORKERS_REGISTRY, mock_worker_client},
         },
     },
@@ -42,9 +43,9 @@ use temporalio_common::{
             },
             workflowservice::v1::{
                 PollActivityTaskQueueResponse, PollNexusTaskQueueResponse,
-                PollWorkflowTaskQueueResponse, RespondActivityTaskCompletedResponse,
-                RespondNexusTaskCompletedResponse, RespondNexusTaskFailedResponse,
-                RespondWorkflowTaskCompletedResponse, ShutdownWorkerResponse,
+                PollWorkflowTaskQueueResponse, RespondNexusTaskCompletedResponse,
+                RespondNexusTaskFailedResponse,
+                ShutdownWorkerResponse,
             },
         },
         test_utils::start_timer_cmd,
@@ -135,7 +136,7 @@ async fn worker_shutdown_during_poll_doesnt_deadlock() {
     let mut mock_client = mock_worker_client();
     mock_client
         .expect_complete_workflow_task()
-        .returning(|_| Ok(RespondWorkflowTaskCompletedResponse::default()));
+        .returning(|_| Ok(WorkflowTaskCompletionSuccess::default()));
     let worker = mock_worker(MocksHolder::from_mock_worker(mock_client, mw));
     let pollfut = worker.poll_workflow_activation();
     let shutdownfut = async {
@@ -195,7 +196,7 @@ async fn complete_with_task_not_found_during_shutdown() {
     let mut mock = mock_worker_client();
     mock.expect_complete_workflow_task()
         .times(1)
-        .returning(|_| Err(tonic::Status::not_found("Workflow task not found.")));
+        .returning(|_| Err(WorkflowTaskCompletionError::Rpc(tonic::Status::not_found("Workflow task not found."))));
     let mh = MockPollCfg::from_resp_batches("fakeid", t, [1], mock);
     let core = mock_worker(build_mock_pollers(mh));
 
@@ -266,7 +267,7 @@ async fn worker_does_not_panic_on_retry_exhaustion_of_nonfatal_net_err() {
     // Return a failure that counts as retryable, and hence we want to be swallowed
     mock.expect_complete_workflow_task()
         .times(1)
-        .returning(|_| Err(tonic::Status::internal("Some retryable error")));
+        .returning(|_| Err(WorkflowTaskCompletionError::Rpc(tonic::Status::internal("Some retryable error"))));
     let mut mh =
         MockPollCfg::from_resp_batches("fakeid", t, [1.into(), ResponseType::AllHistory], mock);
     mh.enforce_correct_number_of_polls = false;
@@ -344,6 +345,10 @@ async fn worker_shutdown_api(#[case] use_cache: bool, #[case] api_success: bool)
         .returning(|| "test-identity".to_string());
     mock.expect_worker_grouping_key().returning(Uuid::new_v4);
     mock.expect_worker_instance_key().returning(Uuid::new_v4);
+    mock.expect_payload_error_limits().returning(|| {
+        use std::sync::{Arc, atomic::AtomicU64};
+        (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)))
+    });
     if api_success {
         mock.expect_shutdown_worker()
             .times(1)
@@ -496,7 +501,7 @@ async fn test_task_type_combinations_unified(
         if enable_local_activities || enable_remote_activities {
             client
                 .expect_complete_activity_task()
-                .returning(|_, _| Ok(RespondActivityTaskCompletedResponse::default()));
+                .returning(|_, _| Ok(ActivityTaskCompletionSuccess::default()));
         }
         if enable_nexus {
             client

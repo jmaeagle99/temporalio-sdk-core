@@ -6,7 +6,10 @@ use parking_lot::Mutex;
 use prost_types::Duration as PbDuration;
 use std::{
     collections::HashMap,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, SystemTime},
 };
 use temporalio_client::{
@@ -15,6 +18,7 @@ use temporalio_client::{
     request_extensions::{IsWorkerTaskLongPoll, NoRetryOnMatching, RetryConfigForCall},
     worker::ClientWorkerSet,
 };
+use temporalio_client::{LimitExceeded, check_payload_limits};
 use temporalio_common::protos::{
     TaskToken,
     coresdk::{workflow_commands::QueryResult, workflow_completion},
@@ -29,7 +33,7 @@ use temporalio_common::protos::{
             TaskQueueKind, TaskQueueType, VersioningBehavior, WorkerVersioningMode,
             WorkflowTaskFailedCause,
         },
-        failure::v1::Failure,
+        failure::v1::{ApplicationFailureInfo, Failure, failure::FailureInfo},
         nexus::{self, v1::NexusTaskFailure},
         protocol::v1::Message as ProtocolMessage,
         query::v1::WorkflowQueryResult,
@@ -43,6 +47,120 @@ use tonic::IntoRequest;
 use uuid::Uuid;
 
 type Result<T, E = tonic::Status> = std::result::Result<T, E>;
+type WorkflowTaskCompletionResult =
+    std::result::Result<WorkflowTaskCompletionSuccess, WorkflowTaskCompletionError>;
+
+/// Returned on the success path of [`WorkerClient::complete_workflow_task`].
+#[derive(Debug, Default)]
+pub struct WorkflowTaskCompletionSuccess {
+    /// The server's response to the completed workflow task.
+    pub response: RespondWorkflowTaskCompletedResponse,
+    /// Payload limit warning information.
+    pub warn_exceeded: Option<LimitExceeded>,
+}
+
+/// Error returned by [`WorkerClient::complete_workflow_task`].
+#[derive(Debug)]
+pub enum WorkflowTaskCompletionError {
+    /// Payload size error limit exceeded; a WFT failure was already sent to the server.
+    PayloadsTooLarge(LimitExceeded),
+    /// Any other gRPC-level error.
+    Rpc(tonic::Status),
+}
+
+impl From<tonic::Status> for WorkflowTaskCompletionError {
+    fn from(s: tonic::Status) -> Self {
+        WorkflowTaskCompletionError::Rpc(s)
+    }
+}
+
+impl std::fmt::Display for WorkflowTaskCompletionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WorkflowTaskCompletionError::PayloadsTooLarge(e) => {
+                write!(f, "payload size limit exceeded: {}", e.message())
+            }
+            WorkflowTaskCompletionError::Rpc(s) => write!(f, "gRPC error: {s}"),
+        }
+    }
+}
+
+impl std::error::Error for WorkflowTaskCompletionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            WorkflowTaskCompletionError::Rpc(s) => Some(s),
+            WorkflowTaskCompletionError::PayloadsTooLarge(_) => None,
+        }
+    }
+}
+
+/// Mirrors [`WorkflowTaskCompletionResult`] for activity task completions.
+pub type ActivityTaskCompletionResult =
+    std::result::Result<ActivityTaskCompletionSuccess, ActivityTaskCompletionError>;
+
+/// Returned on the success path of [`WorkerClient::complete_activity_task`].
+#[derive(Debug, Default)]
+pub struct ActivityTaskCompletionSuccess {
+    /// Set if the payload size warning threshold was crossed.
+    pub warn_exceeded: Option<LimitExceeded>,
+}
+
+/// Error returned by [`WorkerClient::complete_activity_task`].
+#[derive(Debug)]
+pub enum ActivityTaskCompletionError {
+    /// Payload size error limit exceeded; a task failure was already sent to the server.
+    PayloadsTooLarge(LimitExceeded),
+    /// Any other gRPC-level error.
+    Rpc(tonic::Status),
+}
+
+impl From<tonic::Status> for ActivityTaskCompletionError {
+    fn from(s: tonic::Status) -> Self {
+        ActivityTaskCompletionError::Rpc(s)
+    }
+}
+
+impl std::fmt::Display for ActivityTaskCompletionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ActivityTaskCompletionError::PayloadsTooLarge(e) => {
+                write!(f, "payload size limit exceeded: {}", e.message())
+            }
+            ActivityTaskCompletionError::Rpc(s) => write!(f, "gRPC error: {s}"),
+        }
+    }
+}
+
+impl std::error::Error for ActivityTaskCompletionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            ActivityTaskCompletionError::Rpc(s) => Some(s),
+            ActivityTaskCompletionError::PayloadsTooLarge(_) => None,
+        }
+    }
+}
+
+/// Reads an `AtomicU64` limit where `0` means "no limit".
+/// Should only be used for payload and memo size **error** limits.
+#[inline]
+fn load_error_limit(arc: &AtomicU64) -> Option<u64> {
+    let v = arc.load(Ordering::Relaxed);
+    (v > 0).then_some(v)
+}
+
+/// A `Failure` proto for a payload-size-limit violation.
+fn payload_size_exceeded_failure(msg: String) -> Failure {
+    Failure {
+        message: msg,
+        failure_info: Some(FailureInfo::ApplicationFailureInfo(
+            ApplicationFailureInfo {
+                r#type: "PayloadSizeLimitExceeded".to_string(),
+                ..Default::default()
+            },
+        )),
+        ..Default::default()
+    }
+}
 
 pub enum LegacyQueryResult {
     Succeeded(QueryResult),
@@ -56,6 +174,14 @@ pub(crate) struct WorkerClientBag {
     worker_versioning_strategy: WorkerVersioningStrategy,
     worker_instance_key: Uuid,
     worker_heartbeat_map: Arc<Mutex<HashMap<String, ClientHeartbeatData>>>,
+    /// Server-provided payload size error limit in bytes. `0` means not yet set.
+    payload_size_error_limit: Arc<AtomicU64>,
+    /// Server-provided memo size error limit in bytes. `0` means not yet set.
+    memo_size_error_limit: Arc<AtomicU64>,
+    /// Payload size warning threshold in bytes.
+    payload_size_warn_limit: u64,
+    /// Memo size warning threshold in bytes.
+    memo_size_warn_limit: u64,
 }
 
 impl WorkerClientBag {
@@ -64,6 +190,8 @@ impl WorkerClientBag {
         namespace: String,
         worker_versioning_strategy: WorkerVersioningStrategy,
         worker_instance_key: Uuid,
+        payload_size_warn_limit: u64,
+        memo_size_warn_limit: u64,
     ) -> Self {
         Self {
             connection,
@@ -71,6 +199,10 @@ impl WorkerClientBag {
             worker_versioning_strategy,
             worker_instance_key,
             worker_heartbeat_map: Arc::new(Mutex::new(HashMap::new())),
+            payload_size_error_limit: Arc::new(AtomicU64::new(0)),
+            memo_size_error_limit: Arc::new(AtomicU64::new(0)),
+            payload_size_warn_limit,
+            memo_size_warn_limit,
         }
     }
 
@@ -160,13 +292,13 @@ pub trait WorkerClient: Sync + Send {
     async fn complete_workflow_task(
         &self,
         request: WorkflowTaskCompletion,
-    ) -> Result<RespondWorkflowTaskCompletedResponse>;
+    ) -> WorkflowTaskCompletionResult;
     /// Complete an activity task
     async fn complete_activity_task(
         &self,
         task_token: TaskToken,
         result: Option<Payloads>,
-    ) -> Result<RespondActivityTaskCompletedResponse>;
+    ) -> ActivityTaskCompletionResult;
     /// Complete a Nexus task
     async fn complete_nexus_task(
         &self,
@@ -242,8 +374,13 @@ pub trait WorkerClient: Sync + Send {
     fn workers(&self) -> Arc<ClientWorkerSet>;
     /// Indicates if this is a mock client
     fn is_mock(&self) -> bool;
+    /// Returns the shared `Arc<AtomicU64>` stores for the server-provided payload error limits.
+    /// These are updated by `Worker::validate()` after the namespace is described.
+    fn payload_error_limits(&self) -> (Arc<AtomicU64>, Arc<AtomicU64>);
     /// Return name and version of the SDK
     fn sdk_name_and_version(&self) -> (String, String);
+    /// Get the namespace this worker is bound to
+    fn namespace(&self) -> String;
     /// Get worker identity
     fn identity(&self) -> String;
     /// Get worker grouping key
@@ -402,9 +539,9 @@ impl WorkerClient for WorkerClientBag {
     async fn complete_workflow_task(
         &self,
         request: WorkflowTaskCompletion,
-    ) -> Result<RespondWorkflowTaskCompletedResponse> {
+    ) -> WorkflowTaskCompletionResult {
         #[allow(deprecated)] // want to list all fields explicitly
-        let request = RespondWorkflowTaskCompletedRequest {
+        let mut request = RespondWorkflowTaskCompletedRequest {
             task_token: request.task_token.into(),
             commands: request.commands,
             messages: request.messages,
@@ -443,39 +580,112 @@ impl WorkerClient for WorkerClientBag {
             deployment_options: self.deployment_options(),
             resource_id: Default::default(),
         };
-        Ok(self
+
+        // Check payload size limits before sending to server
+        let limit_result = check_payload_limits(
+            &mut request,
+            load_error_limit(&self.payload_size_error_limit),
+            load_error_limit(&self.memo_size_error_limit),
+            self.payload_size_warn_limit,
+            self.memo_size_warn_limit,
+        )
+        .await;
+        if let Some(exceeded) = limit_result.error_exceeded {
+            // Send a WFT failure instead of the completion.
+            self.connection
+                .clone()
+                .respond_workflow_task_failed(
+                    #[allow(deprecated)] // want to list all fields explicitly
+                    RespondWorkflowTaskFailedRequest {
+                        task_token: request.task_token.clone(),
+                        cause: WorkflowTaskFailedCause::PayloadsTooLarge.into(),
+                        failure: Some(payload_size_exceeded_failure(exceeded.message())),
+                        identity: self.identity(),
+                        binary_checksum: self.binary_checksum(),
+                        namespace: self.namespace.clone(),
+                        messages: vec![],
+                        worker_version: self.worker_version_stamp(),
+                        deployment: None,
+                        deployment_options: self.deployment_options(),
+                        resource_id: Default::default(),
+                    }
+                    .into_request(),
+                )
+                .await?;
+            return Err(WorkflowTaskCompletionError::PayloadsTooLarge(exceeded));
+        }
+
+        let response = self
             .connection
             .clone()
             .respond_workflow_task_completed(request.into_request())
             .await?
-            .into_inner())
+            .into_inner();
+        Ok(WorkflowTaskCompletionSuccess {
+            response,
+            warn_exceeded: limit_result.warn_exceeded,
+        })
     }
 
     async fn complete_activity_task(
         &self,
         task_token: TaskToken,
         result: Option<Payloads>,
-    ) -> Result<RespondActivityTaskCompletedResponse> {
-        Ok(self
-            .connection
+    ) -> ActivityTaskCompletionResult {
+        #[allow(deprecated)] // want to list all fields explicitly
+        let mut request = RespondActivityTaskCompletedRequest {
+            task_token: task_token.0.clone(),
+            result,
+            identity: self.identity(),
+            namespace: self.namespace.clone(),
+            worker_version: self.worker_version_stamp(),
+            // Will never be set, deprecated.
+            deployment: None,
+            deployment_options: self.deployment_options(),
+            resource_id: Default::default(),
+        };
+
+        // Check payload size limits before sending to server.
+        let limit_result = check_payload_limits(
+            &mut request,
+            load_error_limit(&self.payload_size_error_limit),
+            load_error_limit(&self.memo_size_error_limit),
+            self.payload_size_warn_limit,
+            self.memo_size_warn_limit,
+        )
+        .await;
+        if let Some(exceeded) = limit_result.error_exceeded {
+            // Send a task failure instead of the completion.
+            self.connection
+                .clone()
+                .respond_activity_task_failed(
+                    #[allow(deprecated)] // want to list all fields explicitly
+                    RespondActivityTaskFailedRequest {
+                        task_token: task_token.0,
+                        failure: Some(payload_size_exceeded_failure(exceeded.message())),
+                        identity: self.identity(),
+                        namespace: self.namespace.clone(),
+                        last_heartbeat_details: None,
+                        worker_version: self.worker_version_stamp(),
+                        deployment: None,
+                        deployment_options: self.deployment_options(),
+                        resource_id: Default::default(),
+                    }
+                    .into_request(),
+                )
+                .await
+                .map_err(ActivityTaskCompletionError::Rpc)?;
+            return Err(ActivityTaskCompletionError::PayloadsTooLarge(exceeded));
+        }
+
+        self.connection
             .clone()
-            .respond_activity_task_completed(
-                #[allow(deprecated)] // want to list all fields explicitly
-                RespondActivityTaskCompletedRequest {
-                    task_token: task_token.0,
-                    result,
-                    identity: self.identity(),
-                    namespace: self.namespace.clone(),
-                    worker_version: self.worker_version_stamp(),
-                    // Will never be set, deprecated.
-                    deployment: None,
-                    deployment_options: self.deployment_options(),
-                    resource_id: Default::default(),
-                }
-                .into_request(),
-            )
-            .await?
-            .into_inner())
+            .respond_activity_task_completed(request.into_request())
+            .await
+            .map_err(ActivityTaskCompletionError::Rpc)?;
+        Ok(ActivityTaskCompletionSuccess {
+            warn_exceeded: limit_result.warn_exceeded,
+        })
     }
 
     async fn complete_nexus_task(
@@ -784,6 +994,10 @@ impl WorkerClient for WorkerClientBag {
         )
     }
 
+    fn namespace(&self) -> String {
+        self.namespace.clone()
+    }
+
     fn identity(&self) -> String {
         self.identity()
     }
@@ -794,6 +1008,13 @@ impl WorkerClient for WorkerClientBag {
 
     fn worker_instance_key(&self) -> Uuid {
         self.worker_instance_key
+    }
+
+    fn payload_error_limits(&self) -> (Arc<AtomicU64>, Arc<AtomicU64>) {
+        (
+            self.payload_size_error_limit.clone(),
+            self.memo_size_error_limit.clone(),
+        )
     }
 
     fn set_heartbeat_client_fields(&self, heartbeat: &mut WorkerHeartbeat) {
@@ -902,5 +1123,21 @@ fn update_slots(slots_info: &mut Option<WorkerSlotsInfo>, client_heartbeat_data:
 
         client_heartbeat_data.total_processed_tasks = wft_slot_info.total_processed_tasks;
         client_heartbeat_data.total_failed_tasks = wft_slot_info.total_failed_tasks;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::load_error_limit;
+    use std::sync::atomic::AtomicU64;
+
+    #[test]
+    fn load_error_limit_zero_means_no_limit() {
+        assert_eq!(load_error_limit(&AtomicU64::new(0)), None);
+    }
+
+    #[test]
+    fn load_error_limit_nonzero_returns_some() {
+        assert_eq!(load_error_limit(&AtomicU64::new(1024)), Some(1024));
     }
 }
