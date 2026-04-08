@@ -172,6 +172,14 @@ typedef struct TemporalCoreConnectionOptions {
    * Optional user data passed to each callback call.
    */
   void *grpc_override_callback_user_data;
+  /**
+   * Warning threshold for payload blob size in client calls (bytes). 0 means no limit.
+   */
+  uint64_t payload_size_warn_limit;
+  /**
+   * Warning threshold for memo size in client calls (bytes). 0 means no limit.
+   */
+  uint64_t memo_size_warn_limit;
 } TemporalCoreConnectionOptions;
 
 typedef struct TemporalCoreByteArray {

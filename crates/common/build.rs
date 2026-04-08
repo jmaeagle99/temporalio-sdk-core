@@ -206,6 +206,17 @@ fn generate_payload_visitor(
     let mut file = File::create(&output_path)?;
     file.write_all(generator.generate().as_bytes())?;
 
+    // Generate the list of WorkflowService RPC names whose request types carry payloads.
+    let rpc_names = generator.workflow_service_payload_rpc_names(&descriptor_set);
+    let entries: String = rpc_names
+        .iter()
+        .map(|n| format!("    \"{n}\",\n"))
+        .collect();
+    let rpc_names_content = format!("&[\n{entries}]");
+    let rpc_names_path = out_dir.join("workflow_service_payload_rpcs.rs");
+    let mut rpc_file = File::create(&rpc_names_path)?;
+    rpc_file.write_all(rpc_names_content.as_bytes())?;
+
     Ok(())
 }
 
@@ -228,6 +239,8 @@ enum PayloadFieldKind {
     RepeatedPayload,
     /// A Payloads message field
     PayloadsMessage,
+    /// A `Memo` message field.
+    Memo,
     /// A map with Payload values
     MapPayload,
     /// A map with nested message values that contain payloads
@@ -341,6 +354,10 @@ impl PayloadVisitorGenerator {
             self.payload_containing.insert(name.to_string());
             return true;
         }
+        if name == "temporal.api.common.v1.Memo" {
+            self.payload_containing.insert(name.to_string());
+            return true;
+        }
 
         let msg = match self.messages.get(name) {
             Some(m) => m.clone(),
@@ -425,8 +442,11 @@ impl PayloadVisitorGenerator {
             return;
         }
 
-        // Skip Payload and Payloads - they are leaf types
-        if name == "temporal.api.common.v1.Payload" || name == "temporal.api.common.v1.Payloads" {
+        // Skip Payload, Payloads, and Memo - they are leaf types with manual/dual-visit impls
+        if name == "temporal.api.common.v1.Payload"
+            || name == "temporal.api.common.v1.Payloads"
+            || name == "temporal.api.common.v1.Memo"
+        {
             return;
         }
 
@@ -569,6 +589,12 @@ impl PayloadVisitorGenerator {
                 proto_path,
                 kind: PayloadFieldKind::PayloadsMessage,
             })
+        } else if type_name == "temporal.api.common.v1.Memo" {
+            Some(PayloadFieldInfo {
+                name: field_name.to_string(),
+                proto_path,
+                kind: PayloadFieldKind::Memo,
+            })
         } else {
             Some(PayloadFieldInfo {
                 name: field_name.to_string(),
@@ -578,23 +604,207 @@ impl PayloadVisitorGenerator {
         }
     }
 
+    /// Returns names of `WorkflowService` RPCs whose request types transitively contain payloads.
+    fn workflow_service_payload_rpc_names(
+        &self,
+        descriptor_set: &FileDescriptorSet,
+    ) -> Vec<String> {
+        let mut names = Vec::new();
+        for file in &descriptor_set.file {
+            for service in &file.service {
+                if service.name.as_deref() != Some("WorkflowService") {
+                    continue;
+                }
+                for method in &service.method {
+                    let input_type = method
+                        .input_type
+                        .as_deref()
+                        .unwrap_or("")
+                        .trim_start_matches('.');
+                    if self.payload_containing.contains(input_type) {
+                        if let Some(name) = &method.name {
+                            names.push(name.clone());
+                        }
+                    }
+                }
+            }
+        }
+        names.sort();
+        names
+    }
+
     fn generate(&self) -> String {
         let mut output = String::new();
         output.push_str("// Generated from descriptors.bin - DO NOT EDIT\n\n");
 
         // Generate impls for each payload-containing type
         for name in self.payload_containing.iter() {
-            if name == "temporal.api.common.v1.Payload" || name == "temporal.api.common.v1.Payloads"
+            if name == "temporal.api.common.v1.Payload"
+                || name == "temporal.api.common.v1.Payloads"
+                || name == "temporal.api.common.v1.Memo"
             {
                 continue;
             }
             if let Some(fields) = self.message_fields.get(name) {
                 output.push_str(&self.generate_impl(name, fields));
                 output.push('\n');
+                output.push_str(&self.generate_memo_visitable_impl(name, fields));
+                output.push('\n');
             }
         }
 
         output
+    }
+
+    /// Generates `impl MemoVisitable for X` for a message.
+    fn generate_memo_visitable_impl(
+        &self,
+        proto_name: &str,
+        fields: &[PayloadFieldInfo],
+    ) -> String {
+        let rust_path = self.proto_to_rust_path(proto_name);
+
+        let mut body = String::new();
+        for field in fields {
+            body.push_str(&self.generate_memo_field_visit(
+                &field.name,
+                &field.proto_path,
+                &field.kind,
+            ));
+        }
+
+        if body.is_empty() {
+            return format!(
+                r#"#[allow(deprecated)]
+impl crate::payload_visitor::MemoVisitable for {rust_path} {{}}
+"#,
+                rust_path = rust_path,
+            );
+        }
+
+        format!(
+            r#"#[allow(deprecated)]
+impl crate::payload_visitor::MemoVisitable for {rust_path} {{
+    fn visit_memos_mut<'a>(
+        &'a mut self,
+        observer: &'a mut (dyn crate::payload_visitor::MemoObserver + Send),
+    ) -> futures::future::BoxFuture<'a, ()> {{
+        Box::pin(async move {{
+{body}        }})
+    }}
+}}
+"#,
+            rust_path = rust_path,
+            body = body,
+        )
+    }
+
+    fn generate_memo_field_visit(
+        &self,
+        field_name: &str,
+        proto_path: &str,
+        kind: &PayloadFieldKind,
+    ) -> String {
+        let rust_field = Self::to_snake_case(field_name);
+
+        match kind {
+            PayloadFieldKind::Memo => {
+                format!(
+                    r#"        if let Some(ref memo) = self.{rust_field} {{
+            observer.observe_memo(crate::payload_visitor::MemoField {{
+                path: "{path}",
+                memo,
+            }}).await;
+        }}
+"#,
+                    rust_field = rust_field,
+                    path = proto_path,
+                )
+            }
+            PayloadFieldKind::NestedMessage => {
+                // Repeated vs optional field.
+                let parent_name = proto_path.rsplit_once('.').map(|(p, _)| p).unwrap_or("");
+                let is_field_repeated = if let Some(msg) = self.messages.get(parent_name) {
+                    msg.field
+                        .iter()
+                        .any(|f| f.name.as_deref() == Some(field_name) && is_repeated(f))
+                } else {
+                    false
+                };
+
+                if is_field_repeated {
+                    format!(
+                        r#"        for item in &mut self.{rust_field} {{
+            item.visit_memos_mut(observer).await;
+        }}
+"#,
+                        rust_field = rust_field,
+                    )
+                } else {
+                    format!(
+                        r#"        if let Some(msg) = &mut self.{rust_field} {{
+            msg.visit_memos_mut(observer).await;
+        }}
+"#,
+                        rust_field = rust_field,
+                    )
+                }
+            }
+            PayloadFieldKind::MapNestedMessage => {
+                format!(
+                    r#"        for item in self.{rust_field}.values_mut() {{
+            item.visit_memos_mut(observer).await;
+        }}
+"#,
+                    rust_field = rust_field,
+                )
+            }
+            PayloadFieldKind::Oneof {
+                oneof_name,
+                variants,
+                total_variants,
+            } => {
+                let parent_proto_name = proto_path.rsplit_once('.').map(|(p, _)| p).unwrap_or("");
+                let enum_path = self.proto_to_rust_oneof_enum_path(parent_proto_name, oneof_name);
+                let rust_field = Self::to_snake_case(oneof_name);
+
+                let mut arms = String::new();
+                for variant in variants {
+                    let variant_name = Self::to_pascal_case(&variant.name);
+                    arms.push_str(&format!(
+                        "                {enum_path}::{variant}(msg) => msg.visit_memos_mut(observer).await,\n",
+                        enum_path = enum_path,
+                        variant = variant_name,
+                    ));
+                }
+
+                if arms.is_empty() {
+                    return String::new();
+                }
+
+                let catch_all = if variants.len() < *total_variants {
+                    "                _ => {}\n"
+                } else {
+                    ""
+                };
+
+                format!(
+                    r#"        if let Some({field}) = &mut self.{field} {{
+            match {field} {{
+{arms}{catch_all}            }}
+        }}
+"#,
+                    field = rust_field,
+                    arms = arms,
+                    catch_all = catch_all,
+                )
+            }
+            // Payload-only fields contain no Memo fields.
+            PayloadFieldKind::SinglePayload
+            | PayloadFieldKind::RepeatedPayload
+            | PayloadFieldKind::PayloadsMessage
+            | PayloadFieldKind::MapPayload => String::new(),
+        }
     }
 
     fn generate_impl(&self, proto_name: &str, fields: &[PayloadFieldInfo]) -> String {
@@ -671,6 +881,21 @@ impl crate::payload_visitor::PayloadVisitable for {rust_path} {{
 "#,
                     field = rust_field,
                     path = proto_path
+                )
+            }
+            PayloadFieldKind::Memo => {
+                // Per-field visits only; whole-Memo observation is in MemoVisitable.
+                format!(
+                    r#"        if let Some(ref mut memo) = self.{field} {{
+            for payload in memo.fields.values_mut() {{
+                visitor.visit(crate::payload_visitor::PayloadField {{
+                    path: "temporal.api.common.v1.Memo.fields",
+                    data: crate::payload_visitor::PayloadFieldData::Single(payload),
+                }}).await;
+            }}
+        }}
+"#,
+                    field = rust_field,
                 )
             }
             PayloadFieldKind::MapPayload => {

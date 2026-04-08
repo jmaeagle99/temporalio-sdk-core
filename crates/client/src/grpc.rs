@@ -13,7 +13,11 @@ use crate::{
 };
 use dyn_clone::DynClone;
 use futures_util::{FutureExt, TryFutureExt, future::BoxFuture};
-use std::{any::Any, marker::PhantomData, sync::Arc};
+use std::{
+    any::Any,
+    marker::PhantomData,
+    sync::{Arc, atomic::AtomicU64},
+};
 use temporalio_common::{
     protos::{
         grpc::health::v1::{health_client::HealthClient, *},
@@ -226,7 +230,14 @@ impl RawClientProducer for Connection {
     }
 
     fn workflow_client(&mut self) -> Box<dyn WorkflowService> {
-        self.inner.service.workflow_service()
+        let svc = self.inner.service.workflow_service();
+        Box::new(crate::payload_check::PayloadCheckingWorkflowService {
+            inner: svc,
+            payload_warn: self.inner.payload_size_warn_limit,
+            memo_warn: self.inner.memo_size_warn_limit,
+            payload_error: None,
+            memo_error: None,
+        })
     }
 
     fn operator_client(&mut self) -> Box<dyn OperatorService> {
@@ -366,6 +377,100 @@ where
         self.inner_mut_refreshed()
             .call(call_name, callfn, req)
             .await
+    }
+}
+
+/// A [`Connection`] wrapper for use by workers that injects server-provided error limits into
+/// [`PayloadCheckingWorkflowService`]. All workflow service calls made through this type are
+/// checked against both error and warning payload limits; all other service calls are forwarded
+/// to the inner connection unchanged.
+///
+/// [`PayloadCheckingWorkflowService`]: crate::payload_check::PayloadCheckingWorkflowService
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct WorkerRawClient {
+    pub(crate) inner: SharedReplaceableClient<Connection>,
+    /// Server-provided payload error limit (bytes). `0` means not yet received.
+    #[doc(hidden)]
+    pub payload_error: Arc<AtomicU64>,
+    /// Server-provided memo error limit (bytes). `0` means not yet received.
+    #[doc(hidden)]
+    pub memo_error: Arc<AtomicU64>,
+}
+
+impl WorkerRawClient {
+    /// Create a new `WorkerRawClient` wrapping the given connection.
+    /// Error limits start at `0` (no limit) and are set later via the returned Arcs.
+    pub fn new(inner: SharedReplaceableClient<Connection>) -> Self {
+        Self {
+            inner,
+            payload_error: Arc::new(AtomicU64::new(0)),
+            memo_error: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// Replace the underlying connection for all clones sharing this instance.
+    pub fn replace_client(&self, new_client: Connection) {
+        self.inner.replace_client(new_client);
+    }
+
+    /// Access the inner [`Connection`] via a copy-on-write reference.
+    pub fn inner_cow(&self) -> std::borrow::Cow<'_, Connection> {
+        self.inner.inner_cow()
+    }
+}
+
+impl RawClientProducer for WorkerRawClient {
+    fn get_workers_info(&self) -> Option<Arc<ClientWorkerSet>> {
+        self.inner.get_workers_info()
+    }
+
+    fn workflow_client(&mut self) -> Box<dyn WorkflowService> {
+        let conn = self.inner.inner_mut_refreshed();
+        let svc = conn.workflow_service_raw();
+        Box::new(crate::payload_check::PayloadCheckingWorkflowService {
+            inner: svc,
+            payload_warn: conn.payload_size_warn_limit(),
+            memo_warn: conn.memo_size_warn_limit(),
+            payload_error: Some(self.payload_error.clone()),
+            memo_error: Some(self.memo_error.clone()),
+        })
+    }
+
+    fn operator_client(&mut self) -> Box<dyn OperatorService> {
+        self.inner.operator_client()
+    }
+
+    fn cloud_client(&mut self) -> Box<dyn CloudService> {
+        self.inner.cloud_client()
+    }
+
+    fn test_client(&mut self) -> Box<dyn TestService> {
+        self.inner.test_client()
+    }
+
+    fn health_client(&mut self) -> Box<dyn HealthService> {
+        self.inner.health_client()
+    }
+}
+
+#[async_trait::async_trait]
+impl RawGrpcCaller for WorkerRawClient {
+    async fn call<F, Req, Resp>(
+        &mut self,
+        call_name: &'static str,
+        callfn: F,
+        req: tonic::Request<Req>,
+    ) -> Result<tonic::Response<Resp>, tonic::Status>
+    where
+        Req: Clone + Unpin + Send + Sync + 'static,
+        Resp: Send + 'static,
+        F: FnMut(
+            tonic::Request<Req>,
+        ) -> BoxFuture<'static, Result<tonic::Response<Resp>, tonic::Status>>,
+        F: Send + Sync + Unpin + 'static,
+    {
+        self.inner.call(call_name, callfn, req).await
     }
 }
 

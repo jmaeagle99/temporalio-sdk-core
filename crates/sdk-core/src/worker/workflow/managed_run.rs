@@ -440,6 +440,12 @@ impl ManagedRun {
                         result: Box::new(qr),
                     },
                     metrics: self.metrics.clone(),
+                    workflow_id: self
+                        .wft
+                        .as_ref()
+                        .map(|t| t.info.wf_id.clone())
+                        .unwrap_or_default(),
+                    workflow_type: self.wfm.machines.workflow_type.clone(),
                 }),
                 resp_chan,
             );
@@ -1080,6 +1086,12 @@ impl ManagedRun {
         data: CompletionDataForWFT,
         due_to_heartbeat_timeout: bool,
     ) -> FulfillableActivationComplete {
+        let workflow_id = self
+            .wft
+            .as_ref()
+            .map(|t| t.info.wf_id.clone())
+            .unwrap_or_default();
+        let workflow_type = self.wfm.machines.workflow_type.clone();
         let mut machines_wft_response = self.wfm.prepare_for_wft_response();
         if data.activation_was_eviction
             && (machines_wft_response.commands().peek().is_some()
@@ -1140,6 +1152,8 @@ impl ManagedRun {
                     attempt,
                 },
                 metrics: self.metrics.clone(),
+                workflow_id,
+                workflow_type,
             })
         } else {
             ActivationCompleteOutcome::DoNothing

@@ -59,7 +59,7 @@ use crate::{
 use anyhow::bail;
 use futures_util::Stream;
 use std::{sync::Arc, time::Duration};
-use temporalio_client::{Connection, SharedReplaceableClient};
+use temporalio_client::{Connection, SharedReplaceableClient, WorkerRawClient};
 use temporalio_common::{
     protos::coresdk::ActivityHeartbeat,
     telemetry::{
@@ -92,7 +92,8 @@ pub fn init_worker(
         &mut connection,
         worker_config.client_identity_override.clone(),
     );
-    let client = SharedReplaceableClient::new(connection);
+    let shared = SharedReplaceableClient::new(connection);
+    let client = WorkerRawClient::new(shared);
     let client_ident = client.inner_cow().identity().to_owned();
     if client_ident.is_empty() {
         bail!("Client identity cannot be empty. Either lang or user should be setting this value");

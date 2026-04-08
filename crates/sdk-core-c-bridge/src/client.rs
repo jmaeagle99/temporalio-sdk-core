@@ -45,6 +45,10 @@ pub struct ConnectionOptions {
     pub grpc_override_callback: ClientGrpcOverrideCallback,
     /// Optional user data passed to each callback call.
     pub grpc_override_callback_user_data: *mut libc::c_void,
+    /// Warning threshold for payload blob size in client calls (bytes). 0 means no limit.
+    pub payload_size_warn_limit: u64,
+    /// Warning threshold for memo size in client calls (bytes). 0 means no limit.
+    pub memo_size_warn_limit: u64,
 }
 
 #[repr(C)]
@@ -131,6 +135,9 @@ pub extern "C" fn temporal_core_client_connect(
             options.grpc_override_callback_user_data,
         ));
     }
+    // Thread warn limits into ConnectionOptions so PayloadCheckingWorkflowService fires for all SDKs.
+    connection_options.payload_size_warn_limit = options.payload_size_warn_limit;
+    connection_options.memo_size_warn_limit = options.memo_size_warn_limit;
     // Spawn async call
     let user_data = UserDataHandle(user_data);
     connection_options.metrics_meter = runtime.core.telemetry().get_temporal_metric_meter();

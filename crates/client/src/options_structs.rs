@@ -71,6 +71,12 @@ pub struct ConnectionOptions {
     pub disable_error_code_metric_tags: bool,
     /// If set, all gRPC calls will be routed through the provided service.
     pub service_override: Option<callback_based::CallbackBasedGrpcService>,
+    /// Payload size warning threshold in bytes. Defaults to 512 KiB.
+    #[builder(default = 512 * 1024)]
+    pub payload_size_warn_limit: u64,
+    /// Memo size warning threshold in bytes. Defaults to 2 KiB.
+    #[builder(default = 2 * 1024)]
+    pub memo_size_warn_limit: u64,
 
     // Internal / Core-based SDK only options below =============================================
     /// If set true, get_system_info will not be called upon connection.

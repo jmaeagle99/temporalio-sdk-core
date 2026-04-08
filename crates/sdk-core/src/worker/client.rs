@@ -6,12 +6,14 @@ use parking_lot::Mutex;
 use prost_types::Duration as PbDuration;
 use std::{
     collections::HashMap,
-    sync::Arc,
+    sync::{Arc, atomic::AtomicU64},
     time::{Duration, SystemTime},
 };
 use temporalio_client::{
-    Connection, Namespace, NamespacedClient, RetryOptions, SharedReplaceableClient,
+    Connection, LimitExceeded, LimitSeverity, Namespace, NamespacedClient, PAYLOADS_TOO_LARGE_KEY,
+    RetryOptions, WorkerRawClient,
     grpc::WorkflowService,
+    limit_exceeded_from_status,
     request_extensions::{IsWorkerTaskLongPoll, NoRetryOnMatching, RetryConfigForCall},
     worker::ClientWorkerSet,
 };
@@ -29,7 +31,7 @@ use temporalio_common::protos::{
             TaskQueueKind, TaskQueueType, VersioningBehavior, WorkerVersioningMode,
             WorkflowTaskFailedCause,
         },
-        failure::v1::Failure,
+        failure::v1::{ApplicationFailureInfo, Failure, failure::FailureInfo},
         nexus::{self, v1::NexusTaskFailure},
         protocol::v1::Message as ProtocolMessage,
         query::v1::WorkflowQueryResult,
@@ -44,6 +46,20 @@ use uuid::Uuid;
 
 type Result<T, E = tonic::Status> = std::result::Result<T, E>;
 
+/// A `Failure` proto for a payload-size-limit violation.
+fn payload_size_exceeded_failure(msg: String) -> Failure {
+    Failure {
+        message: msg,
+        failure_info: Some(FailureInfo::ApplicationFailureInfo(
+            ApplicationFailureInfo {
+                r#type: "PayloadSizeLimitExceeded".to_string(),
+                ..Default::default()
+            },
+        )),
+        ..Default::default()
+    }
+}
+
 pub enum LegacyQueryResult {
     Succeeded(QueryResult),
     Failed(workflow_completion::Failure),
@@ -51,7 +67,7 @@ pub enum LegacyQueryResult {
 
 /// Contains everything a worker needs to interact with the server
 pub(crate) struct WorkerClientBag {
-    connection: SharedReplaceableClient<Connection>,
+    connection: WorkerRawClient,
     namespace: String,
     worker_versioning_strategy: WorkerVersioningStrategy,
     worker_instance_key: Uuid,
@@ -60,7 +76,7 @@ pub(crate) struct WorkerClientBag {
 
 impl WorkerClientBag {
     pub(crate) fn new(
-        connection: SharedReplaceableClient<Connection>,
+        connection: WorkerRawClient,
         namespace: String,
         worker_versioning_strategy: WorkerVersioningStrategy,
         worker_instance_key: Uuid,
@@ -242,8 +258,13 @@ pub trait WorkerClient: Sync + Send {
     fn workers(&self) -> Arc<ClientWorkerSet>;
     /// Indicates if this is a mock client
     fn is_mock(&self) -> bool;
+    /// Returns the shared `Arc<AtomicU64>` stores for the server-provided payload error limits.
+    /// These are updated by `Worker::validate()` after the namespace is described.
+    fn payload_error_limits(&self) -> (Arc<AtomicU64>, Arc<AtomicU64>);
     /// Return name and version of the SDK
     fn sdk_name_and_version(&self) -> (String, String);
+    /// Get the namespace this worker is bound to
+    fn namespace(&self) -> String;
     /// Get worker identity
     fn identity(&self) -> String;
     /// Get worker grouping key
@@ -443,12 +464,48 @@ impl WorkerClient for WorkerClientBag {
             deployment_options: self.deployment_options(),
             resource_id: Default::default(),
         };
-        Ok(self
+
+        // Extract fields needed for WFT failure resubmission before the request is consumed.
+        let task_token = request.task_token.clone();
+
+        match self
             .connection
             .clone()
             .respond_workflow_task_completed(request.into_request())
-            .await?
-            .into_inner())
+            .await
+        {
+            Err(e) if e.metadata().contains_key(PAYLOADS_TOO_LARGE_KEY) => {
+                let exceeded = limit_exceeded_from_status(&e).unwrap_or_else(|| LimitExceeded {
+                    severity: LimitSeverity::Error,
+                    kind: "payloads",
+                    size: 0,
+                    limit: 0,
+                });
+                self.connection
+                    .clone()
+                    .respond_workflow_task_failed(
+                        #[allow(deprecated)] // want to list all fields explicitly
+                        RespondWorkflowTaskFailedRequest {
+                            task_token,
+                            cause: WorkflowTaskFailedCause::PayloadsTooLarge.into(),
+                            failure: Some(payload_size_exceeded_failure(exceeded.message())),
+                            identity: self.identity(),
+                            binary_checksum: self.binary_checksum(),
+                            namespace: self.namespace.clone(),
+                            messages: vec![],
+                            worker_version: self.worker_version_stamp(),
+                            deployment: None,
+                            deployment_options: self.deployment_options(),
+                            resource_id: Default::default(),
+                        }
+                        .into_request(),
+                    )
+                    .await?;
+                Err(e)
+            }
+            Err(e) => Err(e),
+            Ok(resp) => Ok(resp.into_inner()),
+        }
     }
 
     async fn complete_activity_task(
@@ -456,26 +513,59 @@ impl WorkerClient for WorkerClientBag {
         task_token: TaskToken,
         result: Option<Payloads>,
     ) -> Result<RespondActivityTaskCompletedResponse> {
-        Ok(self
+        #[allow(deprecated)] // want to list all fields explicitly
+        let request = RespondActivityTaskCompletedRequest {
+            task_token: task_token.0.clone(),
+            result,
+            identity: self.identity(),
+            namespace: self.namespace.clone(),
+            worker_version: self.worker_version_stamp(),
+            // Will never be set, deprecated.
+            deployment: None,
+            deployment_options: self.deployment_options(),
+            resource_id: Default::default(),
+        };
+
+        // Extract task token before the request is consumed, for failure resubmission.
+        let raw_token = task_token.0.clone();
+
+        match self
             .connection
             .clone()
-            .respond_activity_task_completed(
-                #[allow(deprecated)] // want to list all fields explicitly
-                RespondActivityTaskCompletedRequest {
-                    task_token: task_token.0,
-                    result,
-                    identity: self.identity(),
-                    namespace: self.namespace.clone(),
-                    worker_version: self.worker_version_stamp(),
-                    // Will never be set, deprecated.
-                    deployment: None,
-                    deployment_options: self.deployment_options(),
-                    resource_id: Default::default(),
-                }
-                .into_request(),
-            )
-            .await?
-            .into_inner())
+            .respond_activity_task_completed(request.into_request())
+            .await
+        {
+            Err(e) if e.metadata().contains_key(PAYLOADS_TOO_LARGE_KEY) => {
+                let exceeded = limit_exceeded_from_status(&e).unwrap_or_else(|| LimitExceeded {
+                    severity: LimitSeverity::Error,
+                    kind: "payloads",
+                    size: 0,
+                    limit: 0,
+                });
+                self.connection
+                    .clone()
+                    .respond_activity_task_failed(
+                        #[allow(deprecated)] // want to list all fields explicitly
+                        RespondActivityTaskFailedRequest {
+                            task_token: raw_token,
+                            failure: Some(payload_size_exceeded_failure(exceeded.message())),
+                            identity: self.identity(),
+                            namespace: self.namespace.clone(),
+                            last_heartbeat_details: None,
+                            worker_version: self.worker_version_stamp(),
+                            deployment: None,
+                            deployment_options: self.deployment_options(),
+                            resource_id: Default::default(),
+                        }
+                        .into_request(),
+                    )
+                    .await
+                    .map_err(|e2| e2)?;
+                Err(e)
+            }
+            Err(e) => Err(e),
+            Ok(resp) => Ok(resp.into_inner()),
+        }
     }
 
     async fn complete_nexus_task(
@@ -784,6 +874,10 @@ impl WorkerClient for WorkerClientBag {
         )
     }
 
+    fn namespace(&self) -> String {
+        self.namespace.clone()
+    }
+
     fn identity(&self) -> String {
         self.identity()
     }
@@ -794,6 +888,13 @@ impl WorkerClient for WorkerClientBag {
 
     fn worker_instance_key(&self) -> Uuid {
         self.worker_instance_key
+    }
+
+    fn payload_error_limits(&self) -> (Arc<AtomicU64>, Arc<AtomicU64>) {
+        (
+            self.connection.payload_error.clone(),
+            self.connection.memo_error.clone(),
+        )
     }
 
     fn set_heartbeat_client_fields(&self, heartbeat: &mut WorkerHeartbeat) {

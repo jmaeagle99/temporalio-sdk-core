@@ -16,6 +16,7 @@ pub mod errors;
 pub mod grpc;
 mod metrics;
 mod options_structs;
+mod payload_check;
 /// Visible only for tests
 #[doc(hidden)]
 pub mod proxy;
@@ -27,6 +28,11 @@ pub mod schedules;
 pub mod worker;
 mod workflow_handle;
 
+#[doc(hidden)]
+pub use crate::payload_check::{
+    LimitExceeded, LimitSeverity, PayloadLimitResult, check_payload_limits,
+    limit_exceeded_from_status,
+};
 pub use crate::{
     proxy::HttpConnectProxyOptions,
     retry::{CallType, RETRYABLE_ERROR_CODES},
@@ -35,6 +41,8 @@ pub use async_activity_handle::{
     ActivityHeartbeatResponse, ActivityIdentifier, AsyncActivityHandle,
 };
 
+#[doc(hidden)]
+pub use grpc::WorkerRawClient;
 pub use metrics::{LONG_REQUEST_LATENCY_HISTOGRAM_NAME, REQUEST_LATENCY_HISTOGRAM_NAME};
 pub use options_structs::*;
 pub use replaceable::SharedReplaceableClient;
@@ -115,6 +123,9 @@ static TEMPORAL_NAMESPACE_HEADER_KEY: &str = "temporal-namespace";
 /// Key used to communicate when a GRPC message is too large
 pub static MESSAGE_TOO_LARGE_KEY: &str = "message-too-large";
 #[doc(hidden)]
+/// Key stamped onto a `tonic::Status` when a payload size error limit is exceeded
+pub static PAYLOADS_TOO_LARGE_KEY: &str = "payloads-too-large";
+#[doc(hidden)]
 /// Key used to indicate a error was returned by the retryer because of the short-circuit predicate
 pub static ERROR_RETURNED_DUE_TO_SHORT_CIRCUIT: &str = "short-circuit";
 
@@ -143,6 +154,10 @@ struct ConnectionInner {
     /// Capabilities as read from the `get_system_info` RPC call made on client connection
     capabilities: Option<get_system_info_response::Capabilities>,
     workers: Arc<ClientWorkerSet>,
+    /// Payload size warning threshold in bytes.
+    payload_size_warn_limit: u64,
+    /// Memo size warning threshold in bytes.
+    memo_size_warn_limit: u64,
 }
 
 impl Connection {
@@ -224,8 +239,28 @@ impl Connection {
                 client_version: options.client_version,
                 capabilities,
                 workers: Arc::new(ClientWorkerSet::new()),
+                payload_size_warn_limit: options.payload_size_warn_limit,
+                memo_size_warn_limit: options.memo_size_warn_limit,
             }),
         })
+    }
+
+    /// Returns the payload size warning threshold configured for this connection in bytes.
+    #[doc(hidden)]
+    pub fn payload_size_warn_limit(&self) -> u64 {
+        self.inner.payload_size_warn_limit
+    }
+
+    /// Returns the memo size warning threshold configured for this connection in bytes.
+    #[doc(hidden)]
+    pub fn memo_size_warn_limit(&self) -> u64 {
+        self.inner.memo_size_warn_limit
+    }
+
+    /// Returns the raw workflow service client without any payload-checking wrapper.
+    /// Used by [`WorkerRawClient`] to inject its own error-limit-aware checker.
+    pub(crate) fn workflow_service_raw(&mut self) -> Box<dyn crate::grpc::WorkflowService> {
+        self.inner.service.workflow_service()
     }
 
     /// Set API key, overwriting any previous one.

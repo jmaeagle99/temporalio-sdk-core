@@ -36,6 +36,7 @@ use std::{
     },
     time::{Duration, Instant, SystemTime},
 };
+use temporalio_client::{PAYLOADS_TOO_LARGE_KEY, limit_exceeded_from_status};
 use temporalio_common::protos::{
     coresdk::{
         ActivityHeartbeat, ActivitySlotInfo,
@@ -91,6 +92,8 @@ struct InFlightActInfo {
     workflow_id: String,
     /// Only kept for logging reasons
     workflow_run_id: String,
+    /// Only kept for logging reasons
+    attempt: i32,
     start_time: Instant,
     scheduled_time: Option<SystemTime>,
 }
@@ -126,6 +129,7 @@ impl RemoteInFlightActInfo {
                 workflow_type: poll_resp.workflow_type.clone().unwrap_or_default().name,
                 workflow_id: wec.workflow_id,
                 workflow_run_id: wec.run_id,
+                attempt: poll_resp.attempt,
                 start_time: Instant::now(),
                 scheduled_time: poll_resp.scheduled_time.and_then(|i| i.try_into().ok()),
             },
@@ -321,6 +325,12 @@ impl WorkerActivityTasks {
         client: &dyn WorkerClient,
     ) {
         if let Some((_, act_info)) = self.outstanding_activity_tasks.remove(&task_token) {
+            // Capture before fields are moved into metrics/span below.
+            let log_workflow_id = act_info.base.workflow_id.clone();
+            let log_workflow_type = act_info.base.workflow_type.clone();
+            let log_run_id = act_info.base.workflow_run_id.clone();
+            let log_activity_type = act_info.base.activity_type.clone();
+            let log_attempt = act_info.base.attempt;
             let act_metrics = self.metrics.with_new_attrs([
                 activity_type(act_info.base.activity_type),
                 workflow_type(act_info.base.workflow_type),
@@ -355,10 +365,31 @@ impl WorkerActivityTasks {
                         {
                             act_metrics.act_execution_succeeded(sched_time);
                         }
-                        client
+                        match client
                             .complete_activity_task(task_token.clone(), result.map(Into::into))
                             .await
-                            .err()
+                        {
+                            Ok(_) => None,
+                            Err(ref e) if e.metadata().contains_key(PAYLOADS_TOO_LARGE_KEY) => {
+                                let exceeded = limit_exceeded_from_status(e);
+                                warn!(
+                                    namespace = client.namespace(),
+                                    worker_id = client.identity(),
+                                    workflow_type = log_workflow_type,
+                                    workflow_id = log_workflow_id,
+                                    run_id = log_run_id,
+                                    activity_type = log_activity_type,
+                                    attempt = log_attempt,
+                                    payload_size = exceeded.as_ref().map(|ex| ex.size).unwrap_or(0),
+                                    payload_size_limit =
+                                        exceeded.as_ref().map(|ex| ex.limit).unwrap_or(0),
+                                    "{}",
+                                    exceeded.as_ref().map(|ex| ex.message()).unwrap_or_default(),
+                                );
+                                None
+                            }
+                            Err(e) => Some(e),
+                        }
                     }
                     aer::Status::Failed(ar::Failure { failure }) => {
                         if should_record_failure_metric(&failure) {

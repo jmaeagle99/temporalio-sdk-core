@@ -58,7 +58,9 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use temporalio_client::MESSAGE_TOO_LARGE_KEY;
+use temporalio_client::{
+    MESSAGE_TOO_LARGE_KEY, PAYLOADS_TOO_LARGE_KEY, limit_exceeded_from_status,
+};
 use temporalio_common::{
     protos::{
         TaskToken,
@@ -115,6 +117,7 @@ type InternalFlagsRef = Rc<RefCell<InternalFlags>>;
 
 /// Centralizes all state related to workflows and workflow tasks
 pub(crate) struct Workflows {
+    namespace: String,
     task_queue: String,
     local_tx: UnboundedSender<LocalInput>,
     processing_task: TakeCell<thread::JoinHandle<()>>,
@@ -176,6 +179,7 @@ impl Workflows {
         let (local_tx, local_rx) = unbounded_channel();
         let (fetch_tx, fetch_rx) = unbounded_channel();
         let shutdown_tok = basics.shutdown_token.clone();
+        let namespace = basics.worker_config.namespace.clone();
         let task_queue = basics.worker_config.task_queue.clone();
         let metrics = basics.metrics.clone();
         let default_versioning_behavior = basics.default_versioning_behavior;
@@ -255,6 +259,7 @@ impl Workflows {
             })
             .expect("Must be able to spawn workflow processing thread");
         Self {
+            namespace,
             task_queue,
             local_tx,
             processing_task: TakeCell::new(processing_task),
@@ -353,6 +358,8 @@ impl Workflows {
                         attempt,
                     },
                 metrics: run_metrics,
+                workflow_id,
+                workflow_type,
             } => {
                 let reserved_act_permits =
                     self.reserve_activity_slots_for_outgoing_commands(commands.as_mut_slice());
@@ -446,8 +453,32 @@ impl Workflows {
                                 .wf_task_failed();
                             return Err(e);
                         }
-                        e => {
-                            e?;
+                        // Payload size limit was exceeded — the client layer already sent a task
+                        // failure to the server, so we only need to update metrics and log here.
+                        Err(ref e) if e.metadata().contains_key(PAYLOADS_TOO_LARGE_KEY) => {
+                            let exceeded = limit_exceeded_from_status(e);
+                            warn!(
+                                namespace = self.namespace,
+                                worker_id = self.client.identity(),
+                                workflow_type,
+                                workflow_id,
+                                run_id,
+                                attempt,
+                                payload_size = exceeded.as_ref().map(|ex| ex.size).unwrap_or(0),
+                                payload_size_limit =
+                                    exceeded.as_ref().map(|ex| ex.limit).unwrap_or(0),
+                                "{}",
+                                exceeded.as_ref().map(|ex| ex.message()).unwrap_or_default(),
+                            );
+                            self.metrics
+                                .with_new_attrs([metrics::failure_reason(
+                                    FailureReason::PayloadsTooLarge,
+                                )])
+                                .wf_task_failed();
+                            return Err(e.clone());
+                        }
+                        Err(e) => {
+                            Err(e)?;
                         }
                     };
 
@@ -719,20 +750,26 @@ impl Workflows {
     {
         let mut should_evict = None;
         if let Err(err) = completer().await {
-            match err.code() {
-                // Silence unhandled command errors since the lang SDK cannot do anything
-                // about them besides poll again, which it will do anyway.
-                tonic::Code::InvalidArgument if err.message() == "UnhandledCommand" => {
-                    debug!(error = %err, run_id, "Unhandled command response when completing");
-                    should_evict = Some(EvictionReason::UnhandledCommand);
-                }
-                tonic::Code::NotFound => {
-                    warn!(error = %err, run_id, "Task not found when completing");
-                    should_evict = Some(EvictionReason::TaskNotFound);
-                }
-                _ => {
-                    warn!(error= %err, "Error while completing workflow activation");
-                    should_evict = Some(EvictionReason::Fatal);
+            if err.metadata().contains_key(PAYLOADS_TOO_LARGE_KEY) {
+                // Server will retry on the normal (non-sticky) queue, so the cached state
+                // is unlikely to be reused. Evict to free the slot.
+                should_evict = Some(EvictionReason::PayloadsTooLarge);
+            } else {
+                match err.code() {
+                    // Silence unhandled command errors since the lang SDK cannot do anything
+                    // about them besides poll again, which it will do anyway.
+                    tonic::Code::InvalidArgument if err.message() == "UnhandledCommand" => {
+                        debug!(error = %err, run_id, "Unhandled command response when completing");
+                        should_evict = Some(EvictionReason::UnhandledCommand);
+                    }
+                    tonic::Code::NotFound => {
+                        warn!(error = %err, run_id, "Task not found when completing");
+                        should_evict = Some(EvictionReason::TaskNotFound);
+                    }
+                    _ => {
+                        warn!(error = %err, "Error while completing workflow activation");
+                        should_evict = Some(EvictionReason::Fatal);
+                    }
                 }
             }
         }
@@ -1051,12 +1088,16 @@ struct ServerCommandsWithWorkflowInfo {
     task_token: TaskToken,
     action: ActivationAction,
     metrics: MetricsContext,
+    workflow_id: String,
+    workflow_type: String,
 }
 impl Debug for ServerCommandsWithWorkflowInfo {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ServerCommandsWithWorkflowInfo")
             .field("task_token", &self.task_token)
             .field("action", &self.action)
+            .field("workflow_id", &self.workflow_id)
+            .field("workflow_type", &self.workflow_type)
             .finish()
     }
 }

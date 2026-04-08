@@ -1,7 +1,8 @@
 use crate::{
     common::{
         CoreWfStarter, activity_functions::StdActivities, fake_grpc_server::fake_server,
-        get_integ_runtime_options, get_integ_server_options, get_integ_telem_options, mock_sdk_cfg,
+        get_integ_runtime_options, get_integ_server_options, get_integ_telem_options,
+        integ_namespace, mock_sdk_cfg,
     },
     shared_tests::{self, is_oversize_grpc_event},
 };
@@ -18,7 +19,7 @@ use std::{
     },
     time::Duration,
 };
-use temporalio_client::{Connection, WorkflowStartOptions};
+use temporalio_client::{Client, ClientOptions, Connection, WorkflowStartOptions};
 use temporalio_common::{
     data_converters::{DataConverter, RawValue},
     protos::{
@@ -32,7 +33,7 @@ use temporalio_common::{
         },
         temporal::api::{
             command::v1::command::Attributes,
-            common::v1::WorkerVersionStamp,
+            common::v1::{Payload, WorkerVersionStamp},
             enums::v1::{
                 EventType,
                 WorkflowTaskFailedCause::{self},
@@ -51,20 +52,22 @@ use temporalio_common::{
             },
         },
     },
+    telemetry::{CoreLog, CoreLogConsumer, Logger, TelemetryOptions},
     worker::WorkerTaskTypes,
 };
 use temporalio_macros::{activities, workflow, workflow_methods};
 use temporalio_sdk::{
-    ActivityOptions, LocalActivityOptions, WorkerOptions, WorkflowContext, WorkflowResult,
-    WorkflowTermination,
+    ActivityOptions, ChildWorkflowOptions, LocalActivityOptions, WorkerOptions, WorkflowContext,
+    WorkflowResult, WorkflowTermination,
     activities::{ActivityContext, ActivityError},
     interceptors::WorkerInterceptor,
 };
 use temporalio_sdk_core::{
-    ActivitySlotKind, CoreRuntime, LocalActivitySlotKind, PollError, PollerBehavior,
-    ResourceBasedTuner, ResourceSlotOptions, SlotInfo, SlotInfoTrait, SlotMarkUsedContext,
-    SlotReleaseContext, SlotReservationContext, SlotSupplier, SlotSupplierPermit, TunerBuilder,
-    WorkerConfig, WorkerValidationError, WorkerVersioningStrategy, WorkflowSlotKind, init_worker,
+    ActivitySlotKind, CoreRuntime, LocalActivitySlotKind, PollError,
+    PollerBehavior, ResourceBasedTuner, ResourceSlotOptions, RuntimeOptions, SlotInfo,
+    SlotInfoTrait, SlotMarkUsedContext, SlotReleaseContext, SlotReservationContext, SlotSupplier,
+    SlotSupplierPermit, TunerBuilder, WorkerConfig, WorkerValidationError,
+    WorkerVersioningStrategy, WorkflowSlotKind, init_worker,
     test_help::{
         FakeWfResponses, MockPollCfg, ResponseType, build_mock_pollers, drain_pollers_and_shutdown,
         hist_to_poll_resp, mock_worker, mock_worker_client,
@@ -182,6 +185,154 @@ struct ResourceBasedNonStickyWf;
 impl ResourceBasedNonStickyWf {
     #[run]
     async fn run(_ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
+        Ok(())
+    }
+}
+
+#[workflow]
+#[derive(Default)]
+struct PayloadWarnWf;
+
+#[workflow_methods]
+impl PayloadWarnWf {
+    #[run]
+    async fn run(_ctx: &mut WorkflowContext<Self>) -> WorkflowResult<String> {
+        // Return 256 bytes of data — guaranteed to exceed the 1-byte warn limit.
+        Ok("x".repeat(256))
+    }
+}
+
+// --- Payload/memo warn test fixtures ---
+
+#[workflow]
+#[derive(Default)]
+struct PayloadWarnInputWf;
+
+#[workflow_methods]
+impl PayloadWarnInputWf {
+    #[run]
+    async fn run(_ctx: &mut WorkflowContext<Self>, _input: Vec<u8>) -> WorkflowResult<()> {
+        Ok(())
+    }
+}
+
+#[workflow]
+#[derive(Default)]
+struct MemoUpsertWarnWf;
+
+#[workflow_methods]
+impl MemoUpsertWarnWf {
+    #[run]
+    async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
+        ctx.upsert_memo([(
+            "key".to_string(),
+            Payload {
+                data: vec![0u8; 100],
+                ..Default::default()
+            },
+        )]);
+        Ok(())
+    }
+}
+
+#[workflow]
+#[derive(Default)]
+struct ChildPayloadInputWf;
+
+#[workflow_methods]
+impl ChildPayloadInputWf {
+    #[run]
+    async fn run(_ctx: &mut WorkflowContext<Self>, _input: Vec<u8>) -> WorkflowResult<()> {
+        Ok(())
+    }
+}
+
+#[workflow]
+#[derive(Default)]
+struct ParentSpawnsLargeChildWf;
+
+#[workflow_methods]
+impl ParentSpawnsLargeChildWf {
+    #[run]
+    async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
+        ctx.child_workflow(
+            ChildPayloadInputWf::run,
+            vec![0u8; 256],
+            ChildWorkflowOptions {
+                workflow_id: "child-large-input".to_owned(),
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|e| WorkflowTermination::from(anyhow::Error::from(e)))?
+        .result()
+        .await
+        .map_err(|e| WorkflowTermination::from(anyhow::Error::from(e)))?;
+        Ok(())
+    }
+}
+
+#[workflow]
+#[derive(Default)]
+struct CombinedMemoWarnWf;
+
+#[workflow_methods]
+impl CombinedMemoWarnWf {
+    #[run]
+    async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
+        // Two fields of ~60 bytes each; combined Memo encoded_len exceeds memo_warn_limit.
+        ctx.upsert_memo([
+            (
+                "k1".to_string(),
+                Payload {
+                    data: vec![0u8; 60],
+                    ..Default::default()
+                },
+            ),
+            (
+                "k2".to_string(),
+                Payload {
+                    data: vec![0u8; 60],
+                    ..Default::default()
+                },
+            ),
+        ]);
+        Ok(())
+    }
+}
+
+struct SmallPartsActivities;
+
+#[activities]
+impl SmallPartsActivities {
+    #[activity]
+    async fn two_part(
+        _ctx: ActivityContext,
+        _a: Vec<u8>,
+        _b: Vec<u8>,
+    ) -> Result<(), ActivityError> {
+        Ok(())
+    }
+}
+
+#[workflow]
+#[derive(Default)]
+struct ActivityCombinedInputWf;
+
+#[workflow_methods]
+impl ActivityCombinedInputWf {
+    #[run]
+    async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
+        ctx.start_activity(
+            SmallPartsActivities::two_part,
+            (vec![0u8; 100], vec![0u8; 100]),
+            ActivityOptions {
+                start_to_close_timeout: Some(Duration::from_secs(10)),
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|e| WorkflowTermination::from(anyhow::Error::from(e)))?;
         Ok(())
     }
 }
@@ -982,4 +1133,269 @@ fn test_default_build_id() {
     let o = WorkerOptions::new("task_queue").build();
     assert!(!o.deployment_options.version.build_id.is_empty());
     assert_ne!(o.deployment_options.version.build_id, "undetermined");
+}
+
+/// Verify that a payload exceeding the connection-level warn limit does not cause a task failure
+/// when returning a large result from a workflow, and that the TMPRL1103 warning is logged.
+#[tokio::test]
+async fn payload_size_warn_workflow_result() {
+    #[derive(Debug)]
+    struct CapturingConsumer(Arc<Mutex<Vec<String>>>);
+
+    impl CoreLogConsumer for CapturingConsumer {
+        fn on_log(&self, log: CoreLog) {
+            self.0.lock().unwrap().push(log.message);
+        }
+    }
+
+    let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let runtime = CoreRuntime::new_assume_tokio(
+        RuntimeOptions::builder()
+            .telemetry_options(
+                TelemetryOptions::builder()
+                    .logging(Logger::Push {
+                        filter: "warn".to_string(),
+                        consumer: Arc::new(CapturingConsumer(captured.clone())),
+                    })
+                    .build(),
+            )
+            .build()
+            .unwrap(),
+    )
+    .unwrap();
+
+    // Build a connection with a 1-byte payload warn limit.
+    let mut conn_opts = get_integ_server_options();
+    conn_opts.payload_size_warn_limit = 1;
+    let connection = Connection::connect(conn_opts).await.unwrap();
+    let client = Client::new(connection, ClientOptions::new(integ_namespace()).build()).unwrap();
+
+    let wf_id = "payload_size_warn_workflow_result";
+    let mut starter = CoreWfStarter::new_with_overrides(wf_id, Some(runtime), Some(client));
+    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
+
+    let mut worker = starter.worker().await;
+    worker.register_workflow::<PayloadWarnWf>();
+    let task_queue = starter.get_task_queue().to_owned();
+
+    worker
+        .submit_workflow(
+            PayloadWarnWf::run,
+            (),
+            WorkflowStartOptions::new(task_queue, wf_id.to_owned()).build(),
+        )
+        .await
+        .unwrap();
+
+    worker.run_until_done().await.unwrap();
+
+    // Verify the TMPRL1103 warning was emitted.
+    let logs = captured.lock().unwrap();
+    assert!(
+        logs.iter().any(|msg| msg.contains("TMPRL1103")),
+        "Expected TMPRL1103 warning in captured logs, got: {logs:?}",
+    );
+}
+
+/// Builds a [CoreWfStarter] whose connection has custom payload/memo warn limits, and a
+/// [CoreRuntime] that captures warn-level log messages. Returns `(starter, captured_logs)`.
+async fn make_payload_warn_starter(
+    test_id: &str,
+    payload_warn: u64,
+    memo_warn: u64,
+) -> (CoreWfStarter, Arc<Mutex<Vec<String>>>) {
+    #[derive(Debug)]
+    struct CapturingConsumer(Arc<Mutex<Vec<String>>>);
+    impl CoreLogConsumer for CapturingConsumer {
+        fn on_log(&self, log: CoreLog) {
+            self.0.lock().unwrap().push(log.message);
+        }
+    }
+
+    let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let runtime = CoreRuntime::new_assume_tokio(
+        RuntimeOptions::builder()
+            .telemetry_options(
+                TelemetryOptions::builder()
+                    .logging(Logger::Push {
+                        filter: "warn".to_string(),
+                        consumer: Arc::new(CapturingConsumer(captured.clone())),
+                    })
+                    .build(),
+            )
+            .build()
+            .unwrap(),
+    )
+    .unwrap();
+
+    let mut conn_opts = get_integ_server_options();
+    conn_opts.payload_size_warn_limit = payload_warn;
+    conn_opts.memo_size_warn_limit = memo_warn;
+    let connection = Connection::connect(conn_opts).await.unwrap();
+    let client = Client::new(connection, ClientOptions::new(integ_namespace()).build()).unwrap();
+
+    let starter = CoreWfStarter::new_with_overrides(test_id, Some(runtime), Some(client));
+    (starter, captured)
+}
+
+/// Tests that a workflow started with a large input payload logs a TMPRL1103 warning via
+/// [PayloadCheckingWorkflowService] (client-side, on the start_workflow_execution RPC).
+#[tokio::test]
+async fn payload_size_warn_workflow_start_input() {
+    let wf_id = "payload_size_warn_workflow_start_input";
+    let (mut starter, captured) = make_payload_warn_starter(wf_id, 1, u64::MAX).await;
+    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
+    let mut worker = starter.worker().await;
+    worker.register_workflow::<PayloadWarnInputWf>();
+    let task_queue = starter.get_task_queue().to_owned();
+
+    worker
+        .submit_workflow(
+            PayloadWarnInputWf::run,
+            vec![0u8; 256],
+            WorkflowStartOptions::new(task_queue, wf_id.to_owned()).build(),
+        )
+        .await
+        .unwrap();
+    worker.run_until_done().await.unwrap();
+
+    assert!(
+        captured
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|m| m.contains("TMPRL1103")),
+        "Expected TMPRL1103 warning for oversized workflow start input",
+    );
+}
+
+/// Tests that a workflow calling upsert_memo with a large memo logs a TMPRL1103 warning via
+/// [WorkerClientBag] (on the RespondWorkflowTaskCompleted RPC,
+/// ModifyWorkflowProperties command).
+#[tokio::test]
+async fn memo_size_warn_workflow_upsert() {
+    let wf_id = "memo_size_warn_workflow_upsert";
+    let (mut starter, captured) = make_payload_warn_starter(wf_id, u64::MAX, 1).await;
+    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
+    let mut worker = starter.worker().await;
+    worker.register_workflow::<MemoUpsertWarnWf>();
+    let task_queue = starter.get_task_queue().to_owned();
+
+    worker
+        .submit_workflow(
+            MemoUpsertWarnWf::run,
+            (),
+            WorkflowStartOptions::new(task_queue, wf_id.to_owned()).build(),
+        )
+        .await
+        .unwrap();
+    worker.run_until_done().await.unwrap();
+
+    assert!(
+        captured
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|m| m.contains("TMPRL1103")),
+        "Expected TMPRL1103 warning for oversized memo upsert",
+    );
+}
+
+/// Tests that a child workflow started with a large input payload logs a TMPRL1103 warning via
+/// [WorkerClientBag] (on the RespondWorkflowTaskCompleted RPC,
+/// StartChildWorkflowExecution command input).
+#[tokio::test]
+async fn payload_size_warn_child_workflow_input() {
+    let wf_id = "payload_size_warn_child_workflow_input";
+    let (mut starter, captured) = make_payload_warn_starter(wf_id, 1, u64::MAX).await;
+    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
+    let mut worker = starter.worker().await;
+    worker.register_workflow::<ParentSpawnsLargeChildWf>();
+    worker.register_workflow::<ChildPayloadInputWf>();
+    let task_queue = starter.get_task_queue().to_owned();
+
+    worker
+        .submit_workflow(
+            ParentSpawnsLargeChildWf::run,
+            (),
+            WorkflowStartOptions::new(task_queue, wf_id.to_owned()).build(),
+        )
+        .await
+        .unwrap();
+    worker.run_until_done().await.unwrap();
+
+    assert!(
+        captured
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|m| m.contains("TMPRL1103")),
+        "Expected TMPRL1103 warning for oversized child workflow input",
+    );
+}
+
+/// Tests that upsert_memo with multiple fields whose combined Memo encoded size exceeds the
+/// memo warn limit logs a TMPRL1103 warning, even when each individual field is below the limit.
+#[tokio::test]
+async fn memo_size_warn_combined_upsert() {
+    let wf_id = "memo_size_warn_combined_upsert";
+    // memo_warn = 100: each field (~62 bytes serialized) is below this, but the combined
+    // Memo.encoded_len() (~130+ bytes) exceeds it.
+    let (mut starter, captured) = make_payload_warn_starter(wf_id, u64::MAX, 100).await;
+    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
+    let mut worker = starter.worker().await;
+    worker.register_workflow::<CombinedMemoWarnWf>();
+    let task_queue = starter.get_task_queue().to_owned();
+
+    worker
+        .submit_workflow(
+            CombinedMemoWarnWf::run,
+            (),
+            WorkflowStartOptions::new(task_queue, wf_id.to_owned()).build(),
+        )
+        .await
+        .unwrap();
+    worker.run_until_done().await.unwrap();
+
+    assert!(
+        captured
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|m| m.contains("TMPRL1103")),
+        "Expected TMPRL1103 warning for combined memo exceeding warn limit",
+    );
+}
+
+/// Tests that scheduling an activity with a combined Payloads size exceeding the warn limit logs
+/// a TMPRL1103 warning via [WorkerClientBag] (RespondWorkflowTaskCompleted,
+/// ScheduleActivityTask command input).
+#[tokio::test]
+async fn payload_size_warn_activity_combined_input() {
+    let wf_id = "payload_size_warn_activity_combined_input";
+    let (mut starter, captured) = make_payload_warn_starter(wf_id, 1, u64::MAX).await;
+    let mut worker = starter.worker().await;
+    worker.register_workflow::<ActivityCombinedInputWf>();
+    worker.register_activities(SmallPartsActivities);
+    let task_queue = starter.get_task_queue().to_owned();
+
+    worker
+        .submit_workflow(
+            ActivityCombinedInputWf::run,
+            (),
+            WorkflowStartOptions::new(task_queue, wf_id.to_owned()).build(),
+        )
+        .await
+        .unwrap();
+    worker.run_until_done().await.unwrap();
+
+    assert!(
+        captured
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|m| m.contains("TMPRL1103")),
+        "Expected TMPRL1103 warning for oversized combined activity input",
+    );
 }

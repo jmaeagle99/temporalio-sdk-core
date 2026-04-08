@@ -808,11 +808,7 @@ async fn no_eager_activities_requested_when_worker_options_disable_it(
                 })
                 .count();
             num_eager_requested_clone.store(count, Ordering::Relaxed);
-            Ok(RespondWorkflowTaskCompletedResponse {
-                workflow_task: None,
-                activity_tasks: vec![],
-                reset_history_event_id: 0,
-            })
+            Ok(RespondWorkflowTaskCompletedResponse::default())
         });
     let mut mock = single_hist_mock_sg(wfid, t, [1], mock, true);
     mock.worker_cfg(|wc| {
@@ -897,7 +893,6 @@ async fn activity_tasks_from_completion_are_delivered() {
                 .count();
             num_eager_requested_clone.store(count, Ordering::Relaxed);
             Ok(RespondWorkflowTaskCompletedResponse {
-                workflow_task: None,
                 activity_tasks: (1..4)
                     .map(|i| PollActivityTaskQueueResponse {
                         task_token: vec![i],
@@ -905,7 +900,7 @@ async fn activity_tasks_from_completion_are_delivered() {
                         ..Default::default()
                     })
                     .collect_vec(),
-                reset_history_event_id: 0,
+                ..Default::default()
             })
         });
     mock.expect_complete_activity_task()

@@ -6,7 +6,7 @@
 
 use crate::{
     data_converters::{PayloadCodec, SerializationContextData},
-    protos::temporal::api::common::v1::{Payload, Payloads},
+    protos::temporal::api::common::v1::{Memo, Payload, Payloads},
 };
 use futures::future::BoxFuture;
 
@@ -30,10 +30,24 @@ pub enum PayloadFieldData<'a> {
     Payloads(&'a mut Payloads),
 }
 
+/// A Memo field reference passed to [`MemoObserver::observe_memo`].
+pub struct MemoField<'a> {
+    /// Fully-qualified proto field path.
+    pub path: &'static str,
+    /// The Memo message.
+    pub memo: &'a Memo,
+}
+
 /// Async visitor for transforming payload fields.
 pub trait AsyncPayloadVisitor {
     /// Visit a payload field, potentially transforming it.
     fn visit<'a>(&'a mut self, field: PayloadField<'a>) -> BoxFuture<'a, ()>;
+}
+
+/// Read-only observer for whole Memo messages.
+pub trait MemoObserver {
+    /// Observe a whole Memo message.
+    fn observe_memo<'a>(&'a mut self, field: MemoField<'a>) -> BoxFuture<'a, ()>;
 }
 
 /// Trait for messages that contain Payload fields (directly or transitively).
@@ -45,6 +59,17 @@ pub trait PayloadVisitable: Send {
         &'a mut self,
         visitor: &'a mut (dyn AsyncPayloadVisitor + Send),
     ) -> BoxFuture<'a, ()>;
+}
+
+/// Trait for messages that contain Memo fields.
+pub trait MemoVisitable: Send {
+    /// Observe all Memo fields via a [`MemoObserver`].
+    fn visit_memos_mut<'a>(
+        &'a mut self,
+        _observer: &'a mut (dyn MemoObserver + Send),
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async {})
+    }
 }
 
 /// Check if a field path represents search attributes that should not be encoded.
@@ -153,6 +178,8 @@ pub async fn decode_payloads<M: PayloadVisitable + Send>(
     msg.visit_payloads_mut(&mut visitor).await;
 }
 
+impl MemoVisitable for Payload {}
+
 // Manual impl for Payload - visits itself as a single payload
 impl PayloadVisitable for Payload {
     fn visit_payloads_mut<'a>(
@@ -186,9 +213,36 @@ impl PayloadVisitable for Payloads {
         })
     }
 }
+impl MemoVisitable for Payloads {}
+
+// Visits each Memo field as a single payload.
+impl PayloadVisitable for Memo {
+    fn visit_payloads_mut<'a>(
+        &'a mut self,
+        visitor: &'a mut (dyn AsyncPayloadVisitor + Send),
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            for payload in self.fields.values_mut() {
+                visitor
+                    .visit(PayloadField {
+                        path: "temporal.api.common.v1.Memo.fields",
+                        data: PayloadFieldData::Single(payload),
+                    })
+                    .await;
+            }
+        })
+    }
+}
+impl MemoVisitable for Memo {}
 
 // Include the generated PayloadVisitable implementations
 include!(concat!(env!("OUT_DIR"), "/payload_visitor_impl.rs"));
+
+/// `WorkflowService` RPC names whose request types carry user payloads. Generated at build time.
+pub const WORKFLOW_SERVICE_PAYLOAD_RPC_NAMES: &[&str] = include!(concat!(
+    env!("OUT_DIR"),
+    "/workflow_service_payload_rpcs.rs"
+));
 
 #[cfg(test)]
 mod tests {

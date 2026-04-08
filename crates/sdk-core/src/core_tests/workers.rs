@@ -344,6 +344,10 @@ async fn worker_shutdown_api(#[case] use_cache: bool, #[case] api_success: bool)
         .returning(|| "test-identity".to_string());
     mock.expect_worker_grouping_key().returning(Uuid::new_v4);
     mock.expect_worker_instance_key().returning(Uuid::new_v4);
+    mock.expect_payload_error_limits().returning(|| {
+        use std::sync::{Arc, atomic::AtomicU64};
+        (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)))
+    });
     if api_success {
         mock.expect_shutdown_worker()
             .times(1)
