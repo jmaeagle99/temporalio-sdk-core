@@ -54,6 +54,14 @@ pub(crate) trait RawClientProducer {
 
     /// Return a mutable ref to the health service client instance
     fn health_client(&mut self) -> Box<dyn HealthService>;
+
+    /// Warning-severity payload size limits applied to outgoing requests. Sourced from
+    /// `ConnectionOptions::payload_warning_limits`. Used by the auto-generated payload
+    /// validation layer; defaults to a sensible value for producers that don't own a
+    /// connection (mocks, raw service clients).
+    fn payload_warning_limits(&self) -> temporalio_common::payload_validation::PayloadSizeLimits {
+        temporalio_common::payload_validation::PayloadSizeLimits::default()
+    }
 }
 
 /// Any client that can make gRPC calls. The default implementation simply invokes the passed-in
@@ -244,6 +252,10 @@ impl RawClientProducer for Connection {
     fn health_client(&mut self) -> Box<dyn HealthService> {
         self.inner.service.health_service()
     }
+
+    fn payload_warning_limits(&self) -> temporalio_common::payload_validation::PayloadSizeLimits {
+        self.inner.payload_warning_limits
+    }
 }
 
 impl RawClientProducer for TemporalServiceClient {
@@ -298,6 +310,10 @@ impl RawClientProducer for Client {
     fn health_client(&mut self) -> Box<dyn HealthService> {
         self.connection.health_client()
     }
+
+    fn payload_warning_limits(&self) -> temporalio_common::payload_validation::PayloadSizeLimits {
+        self.connection.payload_warning_limits()
+    }
 }
 
 #[async_trait::async_trait]
@@ -343,6 +359,10 @@ where
 
     fn health_client(&mut self) -> Box<dyn HealthService> {
         self.inner_mut_refreshed().health_client()
+    }
+
+    fn payload_warning_limits(&self) -> temporalio_common::payload_validation::PayloadSizeLimits {
+        self.inner_cow().payload_warning_limits()
     }
 }
 
@@ -448,6 +468,13 @@ macro_rules! proxy_impl {
             mut request: tonic::Request<$req>,
         ) -> BoxFuture<'_, Result<tonic::Response<$resp>, tonic::Status>> {
             $( type_closure_arg(&mut request, $closure); )*
+            if let Err(__pv_status) = crate::grpc::run_payload_validation(
+                stringify!($method),
+                &request,
+                self.payload_warning_limits(),
+            ) {
+                return async move { Err(__pv_status) }.boxed();
+            }
             let mut self_clone = self.clone();
             #[allow(unused_mut)]
             let fact = move |mut req: tonic::Request<$req>| {
@@ -465,6 +492,13 @@ macro_rules! proxy_impl {
             mut request: tonic::Request<$req>,
         ) -> BoxFuture<'_, Result<tonic::Response<$resp>, tonic::Status>> {
             type_closure_arg(&mut request, $closure_request);
+            if let Err(__pv_status) = crate::grpc::run_payload_validation(
+                stringify!($method),
+                &request,
+                self.payload_warning_limits(),
+            ) {
+                return async move { Err(__pv_status) }.boxed();
+            }
             let workers_info = self.get_workers_info();
             let mut self_clone = self.clone();
             #[allow(unused_mut)]
@@ -594,6 +628,56 @@ fn type_closure_arg<T, R>(arg: T, f: impl FnOnce(T) -> R) -> R {
 
 fn type_closure_two_arg<T, R, S>(arg1: R, arg2: T, f: impl FnOnce(R, T) -> S) -> S {
     f(arg1, arg2)
+}
+
+/// Auto-generated payload validation hook called by `proxy_impl!` for every outbound
+/// gRPC method.
+///
+/// * Always applies the warning-level limits from `ConnectionOptions::payload_warning_limits`.
+/// * If a [`crate::request_extensions::WorkerValidationOverride`] extension is present on
+///   the request (attached by the worker layer once it has fetched per-namespace limits),
+///   also applies error-level limits. Returns `Err(tonic::Status::invalid_argument)` if any
+///   error issues are produced so the call never enters the retry / network layer.
+/// * Emits each warning issue via `tracing::warn!` with structured fields.
+pub(crate) fn run_payload_validation<T>(
+    method_name: &'static str,
+    request: &tonic::Request<T>,
+    warning_limits: temporalio_common::payload_validation::PayloadSizeLimits,
+) -> Result<(), tonic::Status>
+where
+    T: temporalio_common::payload_validation::ValidateRequest,
+{
+    use crate::request_extensions::WorkerValidationOverride;
+    use temporalio_common::payload_validation::{
+        DefaultPayloadFieldValidator, ValidationContext,
+    };
+
+    let override_ext = request.extensions().get::<WorkerValidationOverride>();
+    let outcome = if let Some(o) = override_ext {
+        let ctx = ValidationContext::with_error_limits(&warning_limits, &o.error_limits);
+        request
+            .get_ref()
+            .validate(&ctx, &DefaultPayloadFieldValidator)
+    } else {
+        let ctx = ValidationContext::warnings_only(&warning_limits);
+        request
+            .get_ref()
+            .validate(&ctx, &DefaultPayloadFieldValidator)
+    };
+    for w in &outcome.warnings {
+        tracing::warn!(
+            target: "temporal_sdk::payload_validation",
+            method = method_name,
+            field = w.field_path,
+            observed_bytes = ?w.observed_bytes,
+            limit_bytes = ?w.limit_bytes,
+            "{}", w.message,
+        );
+    }
+    if let Some(status) = outcome.to_status() {
+        return Err(status);
+    }
+    Ok(())
 }
 
 proxier! {
@@ -1865,17 +1949,68 @@ proxier! {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::request_extensions::WorkerValidationOverride;
     use crate::{ClientOptions, ConnectionOptions};
     use std::collections::HashSet;
+    use temporalio_common::payload_validation::PayloadSizeLimits;
     use temporalio_common::{
         protos::temporal::api::{
-            operatorservice::v1::DeleteNamespaceRequest, workflowservice::v1::ListNamespacesRequest,
+            common::v1::{Payload, Payloads},
+            operatorservice::v1::DeleteNamespaceRequest,
+            workflowservice::v1::{
+                ListNamespacesRequest, StartWorkflowExecutionRequest,
+            },
         },
         worker::WorkerTaskTypes,
     };
     use tonic::IntoRequest;
     use url::Url;
     use uuid::Uuid;
+
+    fn req_with_oversize_input(bytes: usize) -> tonic::Request<StartWorkflowExecutionRequest> {
+        let mut req = StartWorkflowExecutionRequest::default();
+        req.input = Some(Payloads {
+            payloads: vec![Payload {
+                metadata: Default::default(),
+                data: vec![0u8; bytes].into(),
+                external_payloads: vec![],
+            }],
+        });
+        tonic::Request::new(req)
+    }
+
+    #[test]
+    fn payload_validation_warns_only_without_worker_override() {
+        let req = req_with_oversize_input(8 * 1024);
+        let warn_limits = PayloadSizeLimits::new(1024, 1024);
+        // No worker override → only warnings; should not produce a status.
+        let res = run_payload_validation("start_workflow_execution", &req, warn_limits);
+        assert!(res.is_ok(), "client mode never blocks; got {res:?}");
+    }
+
+    #[test]
+    fn payload_validation_blocks_when_worker_override_exceeded() {
+        let mut req = req_with_oversize_input(8 * 1024);
+        req.extensions_mut().insert(WorkerValidationOverride {
+            error_limits: PayloadSizeLimits::new(2 * 1024, 1024),
+        });
+        let warn_limits = PayloadSizeLimits::new(1024, 1024);
+        let res = run_payload_validation("start_workflow_execution", &req, warn_limits);
+        let status = res.expect_err("worker mode should block oversize payload");
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(status.message().contains("payload validation failed"));
+    }
+
+    #[test]
+    fn payload_validation_allows_when_worker_override_below_limit() {
+        let mut req = req_with_oversize_input(8 * 1024);
+        req.extensions_mut().insert(WorkerValidationOverride {
+            error_limits: PayloadSizeLimits::new(64 * 1024, 1024),
+        });
+        let warn_limits = PayloadSizeLimits::new(1024, 1024);
+        let res = run_payload_validation("start_workflow_execution", &req, warn_limits);
+        assert!(res.is_ok(), "below error limit → pass with warning only");
+    }
 
     // Just to help make sure some stuff compiles. Not run.
     #[allow(dead_code)]

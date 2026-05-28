@@ -273,6 +273,12 @@ pub struct WorkerConfig {
     /// List of storage drivers used by lang.
     #[builder(default)]
     pub storage_drivers: HashSet<StorageDriverInfo>,
+
+    /// If `true`, the worker will not enforce per-namespace payload size error limits
+    /// returned by `DescribeNamespace`. Warning-level checks (sourced from
+    /// `ConnectionOptions::payload_warning_limits`) still run. Default `false`.
+    #[builder(default = false)]
+    pub disable_payload_error_validation: bool,
 }
 
 impl WorkerConfig {
@@ -531,6 +537,19 @@ impl Worker {
                         memo_size_limit_error: api_limits.memo_size_limit_error,
                     })
                 });
+                // Push the server-defined size limits into the worker client so subsequent
+                // outbound calls enforce them as blocking errors via the payload validation
+                // layer. Skipped if the worker has been configured to disable error-level
+                // enforcement.
+                if !self.config.disable_payload_error_validation {
+                    let payload_limits = limits.map(|l| {
+                        temporalio_common::payload_validation::PayloadSizeLimits::new(
+                            l.blob_size_limit_error.max(0) as usize,
+                            l.memo_size_limit_error.max(0) as usize,
+                        )
+                    });
+                    self.client.set_namespace_error_limits(payload_limits);
+                }
                 if let Some(caps) = ns_info.and_then(|ns| ns.capabilities) {
                     if caps.worker_poll_complete_on_shutdown {
                         self.capabilities

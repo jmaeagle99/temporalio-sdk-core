@@ -15,9 +15,12 @@ use std::{
 use temporalio_client::{
     Connection, Namespace, NamespacedClient, RetryOptions, SharedReplaceableClient,
     grpc::WorkflowService,
-    request_extensions::{IsWorkerTaskLongPoll, NoRetryOnMatching, RetryConfigForCall},
+    request_extensions::{
+        IsWorkerTaskLongPoll, NoRetryOnMatching, RetryConfigForCall, WorkerValidationOverride,
+    },
     worker::ClientWorkerSet,
 };
+use temporalio_common::payload_validation::PayloadSizeLimits;
 use temporalio_common::protos::{
     TaskToken,
     coresdk::{workflow_commands::QueryResult, workflow_completion},
@@ -62,6 +65,10 @@ pub(crate) struct WorkerClientBag {
     worker_versioning_strategy: WorkerVersioningStrategy,
     worker_instance_key: Uuid,
     worker_heartbeat_map: Arc<Mutex<HashMap<String, ClientHeartbeatData>>>,
+    /// Per-namespace payload error limits, populated by `Worker::validate` from the
+    /// `DescribeNamespace` response. When set, every outbound call attaches a
+    /// [`WorkerValidationOverride`] extension so the validation layer enforces them.
+    namespace_error_limits: Arc<parking_lot::RwLock<Option<PayloadSizeLimits>>>,
 }
 
 impl WorkerClientBag {
@@ -77,7 +84,29 @@ impl WorkerClientBag {
             worker_versioning_strategy,
             worker_instance_key,
             worker_heartbeat_map: Arc::new(Mutex::new(HashMap::new())),
+            namespace_error_limits: Arc::new(parking_lot::RwLock::new(None)),
         }
+    }
+
+    /// Attach a [`WorkerValidationOverride`] extension to the request if the worker has
+    /// learned the namespace's error limits via `DescribeNamespace`.
+    fn attach_validation_extension<T>(&self, request: &mut tonic::Request<T>) {
+        if let Some(limits) = *self.namespace_error_limits.read() {
+            request
+                .extensions_mut()
+                .insert(WorkerValidationOverride {
+                    error_limits: limits,
+                });
+        }
+    }
+
+    /// Build a `tonic::Request` carrying the worker-mode payload validation extension.
+    /// Used everywhere `body.into_request()` was previously used so that error-level
+    /// limits get enforced once they have been populated by `Worker::validate`.
+    fn worker_req<T>(&self, body: T) -> tonic::Request<T> {
+        let mut req = tonic::Request::new(body);
+        self.attach_validation_extension(&mut req);
+        req
     }
 
     fn identity(&self) -> String {
@@ -263,6 +292,12 @@ pub trait WorkerClient: Sync + Send {
     /// Sets the client-reliant fields for WorkerHeartbeat. This also updates client-level tracking
     /// of heartbeat fields, like last heartbeat timestamp.
     fn set_heartbeat_client_fields(&self, heartbeat: &mut WorkerHeartbeat);
+
+    /// Push per-namespace payload error limits — produced by `Worker::validate` from the
+    /// `DescribeNamespace` response — into the client. Subsequent outbound calls will
+    /// attach a [`temporalio_client::request_extensions::WorkerValidationOverride`] so
+    /// the validation layer enforces these as blocking errors. Pass `None` to clear.
+    fn set_namespace_error_limits(&self, _limits: Option<PayloadSizeLimits>) {}
 }
 
 /// Configuration options shared by workflow, activity, and Nexus polling calls
@@ -328,6 +363,7 @@ impl WorkerClient for WorkerClientBag {
             poller_group_id: Default::default(),
         }
         .into_request();
+        self.attach_validation_extension(&mut request);
         request.extensions_mut().insert(IsWorkerTaskLongPoll);
         if let Some(nr) = poll_options.no_retry {
             request.extensions_mut().insert(nr);
@@ -368,6 +404,7 @@ impl WorkerClient for WorkerClientBag {
             poller_group_id: Default::default(),
         }
         .into_request();
+        self.attach_validation_extension(&mut request);
         request.extensions_mut().insert(IsWorkerTaskLongPoll);
         if let Some(nr) = poll_options.no_retry {
             request.extensions_mut().insert(nr);
@@ -412,6 +449,7 @@ impl WorkerClient for WorkerClientBag {
             poller_group_id: Default::default(),
         }
         .into_request();
+        self.attach_validation_extension(&mut request);
         request.extensions_mut().insert(IsWorkerTaskLongPoll);
         if let Some(nr) = poll_options.no_retry {
             request.extensions_mut().insert(nr);
@@ -477,7 +515,7 @@ impl WorkerClient for WorkerClientBag {
         Ok(self
             .connection
             .clone()
-            .respond_workflow_task_completed(request.into_request())
+            .respond_workflow_task_completed(self.worker_req(request))
             .await?
             .into_inner())
     }
@@ -491,7 +529,7 @@ impl WorkerClient for WorkerClientBag {
             .connection
             .clone()
             .respond_activity_task_completed(
-                #[allow(deprecated)] // want to list all fields explicitly
+                self.worker_req(#[allow(deprecated)] // want to list all fields explicitly
                 RespondActivityTaskCompletedRequest {
                     task_token: task_token.0,
                     result,
@@ -502,8 +540,7 @@ impl WorkerClient for WorkerClientBag {
                     deployment: None,
                     deployment_options: self.deployment_options(),
                     resource_id: Default::default(),
-                }
-                .into_request(),
+                }),
             )
             .await?
             .into_inner())
@@ -518,14 +555,13 @@ impl WorkerClient for WorkerClientBag {
             .connection
             .clone()
             .respond_nexus_task_completed(
-                RespondNexusTaskCompletedRequest {
+                self.worker_req(RespondNexusTaskCompletedRequest {
                     namespace: self.namespace.clone(),
                     identity: self.identity(),
                     task_token: task_token.0,
                     response: Some(response),
                     poller_group_id: Default::default(),
-                }
-                .into_request(),
+                }),
             )
             .await?
             .into_inner())
@@ -540,14 +576,13 @@ impl WorkerClient for WorkerClientBag {
             .connection
             .clone()
             .record_activity_task_heartbeat(
-                RecordActivityTaskHeartbeatRequest {
+                self.worker_req(RecordActivityTaskHeartbeatRequest {
                     task_token: task_token.0,
                     details,
                     identity: self.identity(),
                     namespace: self.namespace.clone(),
                     resource_id: Default::default(),
-                }
-                .into_request(),
+                }),
             )
             .await?
             .into_inner())
@@ -562,7 +597,7 @@ impl WorkerClient for WorkerClientBag {
             .connection
             .clone()
             .respond_activity_task_canceled(
-                #[allow(deprecated)] // want to list all fields explicitly
+                self.worker_req(#[allow(deprecated)] // want to list all fields explicitly
                 RespondActivityTaskCanceledRequest {
                     task_token: task_token.0,
                     details,
@@ -573,8 +608,7 @@ impl WorkerClient for WorkerClientBag {
                     deployment: None,
                     deployment_options: self.deployment_options(),
                     resource_id: Default::default(),
-                }
-                .into_request(),
+                }),
             )
             .await?
             .into_inner())
@@ -589,7 +623,7 @@ impl WorkerClient for WorkerClientBag {
             .connection
             .clone()
             .respond_activity_task_failed(
-                #[allow(deprecated)] // want to list all fields explicitly
+                self.worker_req(#[allow(deprecated)] // want to list all fields explicitly
                 RespondActivityTaskFailedRequest {
                     task_token: task_token.0,
                     failure,
@@ -602,8 +636,7 @@ impl WorkerClient for WorkerClientBag {
                     deployment: None,
                     deployment_options: self.deployment_options(),
                     resource_id: Default::default(),
-                }
-                .into_request(),
+                }),
             )
             .await?
             .into_inner())
@@ -633,7 +666,7 @@ impl WorkerClient for WorkerClientBag {
         Ok(self
             .connection
             .clone()
-            .respond_workflow_task_failed(request.into_request())
+            .respond_workflow_task_failed(self.worker_req(request))
             .await?
             .into_inner())
     }
@@ -652,7 +685,7 @@ impl WorkerClient for WorkerClientBag {
             .connection
             .clone()
             .respond_nexus_task_failed(
-                #[allow(deprecated)]
+                self.worker_req(#[allow(deprecated)]
                 RespondNexusTaskFailedRequest {
                     namespace: self.namespace.clone(),
                     identity: self.identity(),
@@ -660,8 +693,7 @@ impl WorkerClient for WorkerClientBag {
                     failure,
                     error,
                     poller_group_id: Default::default(),
-                }
-                .into_request(),
+                }),
             )
             .await?
             .into_inner())
@@ -676,7 +708,7 @@ impl WorkerClient for WorkerClientBag {
         Ok(self
             .connection
             .clone()
-            .get_workflow_execution_history(
+            .get_workflow_execution_history(self.worker_req(
                 GetWorkflowExecutionHistoryRequest {
                     namespace: self.namespace.clone(),
                     execution: Some(WorkflowExecution {
@@ -685,9 +717,8 @@ impl WorkerClient for WorkerClientBag {
                     }),
                     next_page_token: page_token,
                     ..Default::default()
-                }
-                .into_request(),
-            )
+                },
+            ))
             .await?
             .into_inner())
     }
@@ -713,7 +744,7 @@ impl WorkerClient for WorkerClientBag {
             .connection
             .clone()
             .respond_query_task_completed(
-                RespondQueryTaskCompletedRequest {
+                self.worker_req(RespondQueryTaskCompletedRequest {
                     task_token: task_token.into(),
                     completed_type: completed_type as i32,
                     query_result,
@@ -722,8 +753,7 @@ impl WorkerClient for WorkerClientBag {
                     failure,
                     cause: cause.into(),
                     poller_group_id: Default::default(),
-                }
-                .into_request(),
+                }),
             )
             .await?
             .into_inner())
@@ -733,11 +763,9 @@ impl WorkerClient for WorkerClientBag {
         Ok(self
             .connection
             .clone()
-            .describe_namespace(
-                Namespace::Name(self.namespace.clone())
-                    .into_describe_namespace_request()
-                    .into_request(),
-            )
+            .describe_namespace(self.worker_req(
+                Namespace::Name(self.namespace.clone()).into_describe_namespace_request(),
+            ))
             .await?
             .into_inner())
     }
@@ -764,6 +792,7 @@ impl WorkerClient for WorkerClientBag {
             task_queue_types: task_queue_types.into_iter().map(|t| t as i32).collect(),
         }
         .into_request();
+        self.attach_validation_extension(&mut request);
         request
             .extensions_mut()
             .insert(RetryConfigForCall(RetryOptions::no_retries()));
@@ -789,7 +818,7 @@ impl WorkerClient for WorkerClientBag {
         Ok(self
             .connection
             .clone()
-            .record_worker_heartbeat(request.into_request())
+            .record_worker_heartbeat(self.worker_req(request))
             .await?
             .into_inner())
     }
@@ -872,6 +901,10 @@ impl WorkerClient for WorkerClientBag {
             &mut heartbeat.local_activity_slots_info,
             &mut client_heartbeat_data.local_activity_slots_info,
         );
+    }
+
+    fn set_namespace_error_limits(&self, limits: Option<PayloadSizeLimits>) {
+        *self.namespace_error_limits.write() = limits;
     }
 }
 

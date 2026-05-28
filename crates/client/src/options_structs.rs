@@ -3,6 +3,7 @@ use http::Uri;
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use temporalio_common::{
     data_converters::DataConverter,
+    payload_validation::PayloadSizeLimits,
     protos::temporal::api::{
         common::{
             self,
@@ -78,6 +79,13 @@ pub struct ConnectionOptions {
     pub disable_error_code_metric_tags: bool,
     /// If set, all gRPC calls will be routed through the provided service.
     pub service_override: Option<callback_based::CallbackBasedGrpcService>,
+    /// Warning thresholds applied by the payload-validation layer to every outbound
+    /// gRPC request that carries Temporal API payload-bearing fields. Exceeding any
+    /// threshold logs a `tracing::warn!` but does not block the call. Worker-mode
+    /// callers may additionally enforce server-defined error limits (see
+    /// [crate::request_extensions::WorkerValidationOverride]).
+    #[builder(default)]
+    pub payload_warning_limits: PayloadSizeLimits,
 
     // Internal / Core-based SDK only options below =============================================
     /// If set true, get_system_info will not be called upon connection.

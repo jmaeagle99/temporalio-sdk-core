@@ -155,6 +155,7 @@ struct ConnectionInner {
     /// Capabilities as read from the `get_system_info` RPC call made on client connection
     capabilities: Option<get_system_info_response::Capabilities>,
     workers: Arc<ClientWorkerSet>,
+    payload_warning_limits: temporalio_common::payload_validation::PayloadSizeLimits,
     _dns_task: Option<Arc<dns::DnsReresolutionHandle>>,
 }
 
@@ -264,6 +265,7 @@ impl Connection {
                 client_version: options.client_version,
                 capabilities,
                 workers: Arc::new(ClientWorkerSet::new()),
+                payload_warning_limits: options.payload_warning_limits,
                 _dns_task: dns_task,
             }),
         })
